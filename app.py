@@ -71,7 +71,7 @@ st.title("📈 超短線交易：多時框即時看盤面板")
 col_setting, col_price, col_info = st.columns([1.5, 1.5, 2])
 
 with col_setting:
-    symbol = st.selectbox("請選擇交易對", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"])
+    symbol = st.selectbox("請選擇交易對", ["BTCUSDT", "ETHUSDT", "BNBUSDT"])
 
 with col_info:
     st.info("🔄 報價每 1 秒更新，圖表每 10 秒更新。可縮放平移。")
