@@ -139,4 +139,59 @@ with col_setting:
 
 @st.fragment(run_every=1)
 def show_realtime_price(selected_symbol):
-    url = "
+    url = "https://data-api.binance.vision/api/v3/ticker/price"
+    try:
+        res = requests.get(url, params={"symbol": selected_symbol}).json()
+        current_price = float(res['price'])
+        
+        # 新增最上方的 1 秒級別倒數計時器
+        now = pd.Timestamp.utcnow() + pd.Timedelta(hours=8)
+        next_5m = now.ceil('5min')
+        if next_5m == now: next_5m = now + pd.Timedelta(minutes=5)
+        sec_left = int((next_5m - now).total_seconds())
+        countdown = f"{sec_left // 60:02d}:{sec_left % 60:02d}"
+        
+        st.metric(label=f"💰 {selected_symbol} 即時現價 ｜ ⏳ 距離結算倒數: {countdown}", value=f"{current_price:,.2f}")
+    except:
+        st.metric(label="連線狀態", value="載入中...")
+
+with col_price:
+    show_realtime_price(symbol)
+    
+with col_info:
+    st.info("💡 實戰口訣：重點關注【倒數 1 分鐘】內的保衛戰訊號，勝率最高！")
+
+@st.fragment(run_every=10)
+def show_prediction_dashboard(selected_symbol):
+    df_1m = add_technical_indicators(get_binance_klines(selected_symbol, "1m"))
+    df_5m = add_technical_indicators(get_binance_klines(selected_symbol, "5m"))
+    df_15m = add_technical_indicators(get_binance_klines(selected_symbol, "15m"))
+    
+    # 傳入 1m, 5m(為了抓基準價), 15m 三個時框
+    signal_text, signal_type = generate_prediction_signal(df_1m, df_5m, df_15m)
+    
+    if signal_type == "success":
+        st.success(signal_text)
+        play_alert_sound()
+    elif signal_type == "error":
+        st.error(signal_text)
+        play_alert_sound()
+    elif signal_type == "warning":
+        st.warning(signal_text)
+    else:
+        st.info(signal_text)
+    
+    col1, col2, col3 = st.columns(3)
+    chart_config = {'displayModeBar': False, 'scrollZoom': True}
+    
+    with col1:
+        if not df_1m.empty:
+            st.plotly_chart(plot_advanced_candlestick(df_1m, "1 分鐘線 (尋找超買超賣邊界)"), use_container_width=True, config=chart_config, key="c1")
+    with col2:
+        if not df_5m.empty:
+            st.plotly_chart(plot_advanced_candlestick(df_5m, "5 分鐘線 (預測結算目標區)"), use_container_width=True, config=chart_config, key="c5")
+    with col3:
+        if not df_15m.empty:
+            st.plotly_chart(plot_advanced_candlestick(df_15m, "15 分鐘線 (確認主力大趨勢)"), use_container_width=True, config=chart_config, key="c15")
+
+show_prediction_dashboard(symbol)
