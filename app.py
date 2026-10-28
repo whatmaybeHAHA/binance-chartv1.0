@@ -14,7 +14,7 @@ def get_binance_klines(symbol, interval, limit=60):
     """
     從幣安公開 API 抓取 K 線資料
     """
-    url = "https://api.binance.com/api/v3/klines"
+    url = "https://data-api.binance.vision/api/v3/klines"
     params = {
         "symbol": symbol,
         "interval": interval,
