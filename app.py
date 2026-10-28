@@ -99,8 +99,7 @@ def plot_advanced_candlestick(df, title):
 fig.update_layout(
         title=dict(text=f"{title} | RSI: {latest_rsi:.1f}", font=dict(size=16)),
         xaxis_rangeslider_visible=False,
-        # 將底部邊距 (b) 從 10 增加到 60，留出空間給圖例
-        margin=dict(l=10, r=10, t=40, b=60), 
+        margin=dict(l=10, r=10, t=40, b=60),
         height=450,
         template="plotly_dark",
         uirevision="constant",
@@ -108,12 +107,10 @@ fig.update_layout(
             text=f"📅 {latest_date}", xref="paper", yref="paper", x=1.0, y=1.05,
             xanchor="right", yanchor="bottom", showarrow=False, font=dict(size=12, color="#AAAAAA")
         )],
-        # 修改這裡：將圖例移到圖表底部 (y=-0.2) 並置中 (x=0.5)
-        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5) 
+        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5)
     )
     
     fig.update_xaxes(tickangle=-45, nticks=8, tickformat="%H:%M") 
-    # 限制圖表初始只顯示最後 80 根，確保不擁擠
     fig.update_xaxes(range=[df['Open time'].iloc[-80], df['Open time'].iloc[-1]])
     
     return fig
