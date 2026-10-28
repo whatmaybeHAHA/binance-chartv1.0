@@ -6,10 +6,11 @@ import plotly.graph_objects as go
 st.set_page_config(layout="wide", page_title="幣安 5 分鐘預測高勝率看盤系統")
 
 def play_alert_sound():
-    """播放高勝率進場提示音"""
-    audio_html = """
-        <audio autoplay>
-            <source src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg" type="audio/ogg">
+    """播放高勝率進場提示音 (強制更新時間戳記)"""
+    t = pd.Timestamp.now().timestamp()
+    audio_html = f"""
+        <audio autoplay style="display:none;">
+            <source src="https://actions.google.com/sounds/v1/alarms/beep_short.ogg?v={t}" type="audio/ogg">
         </audio>
     """
     st.markdown(audio_html, unsafe_allow_html=True)
@@ -30,7 +31,6 @@ def get_binance_klines(symbol, interval, limit=150):
             df[col] = df[col].astype(float)
         return df
     except Exception as e:
-        st.error(f"獲取資料發生錯誤: {e}")
         return pd.DataFrame()
 
 def add_technical_indicators(df):
@@ -49,7 +49,47 @@ def add_technical_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df
 
+def generate_radar_signal(df_1m, df_5m, df_15m, symbol_name):
+    """專為背景雷達設計的輕量級無聲訊號判斷"""
+    if df_1m.empty or df_5m.empty or df_15m.empty:
+        return f"[{symbol_name}] ⏳ 載入中..."
+        
+    latest_1m = df_1m.iloc[-1]
+    latest_5m = df_5m.iloc[-1]
+    latest_15m = df_15m.iloc[-1]
+    
+    base_price = latest_5m['Open']
+    current_price = latest_1m['Close']
+    price_diff = current_price - base_price
+    
+    now = pd.Timestamp.utcnow() + pd.Timedelta(hours=8)
+    next_5m = now.ceil('5min')
+    if next_5m == now: next_5m = now + pd.Timedelta(minutes=5)
+    sec_left = int((next_5m - now).total_seconds())
+    countdown = f"{sec_left // 60:02d}:{sec_left % 60:02d}"
+    
+    trend_up = latest_15m['MA5'] > latest_15m['MA20']
+    rsi_1m = latest_1m['RSI']
+    
+    if sec_left <= 60:
+        if price_diff > 0 and rsi_1m > 40:
+            return f"**[{symbol_name}] 🟢 買漲 (剩 {countdown})**"
+        elif price_diff < 0 and rsi_1m < 60:
+            return f"**[{symbol_name}] 🔴 買跌 (剩 {countdown})**"
+    else:
+        if price_diff > 0 and trend_up and rsi_1m > 50:
+            return f"[{symbol_name}] 📈 順勢買漲"
+        elif price_diff < 0 and not trend_up and rsi_1m < 50:
+            return f"[{symbol_name}] 📉 順勢買跌"
+        elif rsi_1m < 30 and price_diff < 0:
+            return f"[{symbol_name}] ⚠️ 潛在反彈"
+        elif rsi_1m > 70 and price_diff > 0:
+            return f"[{symbol_name}] ⚠️ 潛在回落"
+            
+    return f"[{symbol_name}] ⚖️ 觀望中"
+
 def generate_prediction_signal(df_1m, df_5m, df_15m):
+    """主戰場的 AI 戰術邏輯 (有聲音)"""
     if df_1m.empty or df_5m.empty or df_15m.empty:
         return "資料載入中...", "info"
         
@@ -63,8 +103,7 @@ def generate_prediction_signal(df_1m, df_5m, df_15m):
     
     now = pd.Timestamp.utcnow() + pd.Timedelta(hours=8)
     next_5m = now.ceil('5min')
-    if next_5m == now: 
-        next_5m = now + pd.Timedelta(minutes=5)
+    if next_5m == now: next_5m = now + pd.Timedelta(minutes=5)
     sec_left = int((next_5m - now).total_seconds())
     min_str = sec_left // 60
     sec_str = sec_left % 60
@@ -92,7 +131,6 @@ def generate_prediction_signal(df_1m, df_5m, df_15m):
         else:
             return f"⏱️ 【剩餘 {countdown}】 ⚖️ 觀望 - 價格在基準水面 {base_price} 附近隨機震盪，等待邊界訊號。", "info"
 
-# 🌟 新增 baseline_price 參數
 def plot_advanced_candlestick(df, title, baseline_price=None):
     latest_date = df['Open time'].iloc[-1].strftime('%Y-%m-%d')
     latest_rsi = df['RSI'].iloc[-1]
@@ -108,7 +146,6 @@ def plot_advanced_candlestick(df, title, baseline_price=None):
     fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Upper'], line=dict(color='rgba(33, 150, 243, 0.6)', width=1.5, dash='dot'), name='布林上軌'))
     fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Lower'], line=dict(color='rgba(33, 150, 243, 0.6)', width=1.5, dash='dot'), name='布林下軌'))
     
-    # 🌟 繪製開盤基準平線 (白色的虛線)
     if baseline_price is not None:
         fig.add_hline(
             y=baseline_price, 
@@ -140,11 +177,15 @@ def plot_advanced_candlestick(df, title, baseline_price=None):
     fig.update_xaxes(range=[df['Open time'].iloc[-80], df['Open time'].iloc[-1]])
     return fig
 
+# --- 網頁介面設計 ---
 st.title("🎯 Binance Predict 5分鐘勝率提升器")
+
+# 🌟 已經將 SOLUSDT 移除
+available_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 col_setting, col_price, col_info = st.columns([1.5, 1.5, 2])
 with col_setting:
-    symbol = st.selectbox("選擇預測交易對", ["BTCUSDT", "ETHUSDT", "BNBUSDT"])
+    symbol = st.selectbox("選擇主戰場 (發出音效)", available_symbols)
 
 @st.fragment(run_every=1)
 def show_realtime_price(selected_symbol):
@@ -170,7 +211,26 @@ with col_info:
     st.info("💡 實戰口訣：重點關注【倒數 1 分鐘】內的保衛戰訊號，勝率最高！")
 
 @st.fragment(run_every=10)
-def show_prediction_dashboard(selected_symbol):
+def show_prediction_dashboard(selected_symbol, all_symbols):
+    # --- 1. 背景靜音雷達 (掃描非選取中的幣種) ---
+    other_symbols = [s for s in all_symbols if s != selected_symbol]
+    radar_messages = []
+    
+    for osym in other_symbols:
+        # 為了提升速度，限制只抓取 100 根 K 線進行計算即可
+        d1 = add_technical_indicators(get_binance_klines(osym, "1m", limit=100))
+        d5 = add_technical_indicators(get_binance_klines(osym, "5m", limit=100))
+        d15 = add_technical_indicators(get_binance_klines(osym, "15m", limit=100))
+        # 轉換名稱顯示，例如把 BTCUSDT 變成 BTC
+        clean_name = osym.replace("USDT", "") 
+        radar_msg = generate_radar_signal(d1, d5, d15, clean_name)
+        radar_messages.append(radar_msg)
+    
+    # 顯示雷達跑馬燈
+    st.markdown(f"📡 **背景靜音雷達：** {' ｜ '.join(radar_messages)}")
+    st.divider() # 加一條分隔線區隔雷達與主戰場
+    
+    # --- 2. 主戰場資料抓取與訊號判定 (有聲音) ---
     df_1m = add_technical_indicators(get_binance_klines(selected_symbol, "1m"))
     df_5m = add_technical_indicators(get_binance_klines(selected_symbol, "5m"))
     df_15m = add_technical_indicators(get_binance_klines(selected_symbol, "15m"))
@@ -188,7 +248,6 @@ def show_prediction_dashboard(selected_symbol):
     else:
         st.info(signal_text)
     
-    # 🌟 擷取最新的 5 分鐘開盤價作為基準線
     current_base_price = df_5m.iloc[-1]['Open'] if not df_5m.empty else None
     
     col1, col2, col3 = st.columns(3)
@@ -196,14 +255,12 @@ def show_prediction_dashboard(selected_symbol):
     
     with col1:
         if not df_1m.empty:
-            # 傳入 baseline_price 畫線
             st.plotly_chart(plot_advanced_candlestick(df_1m, "1 分鐘線 (尋找超買超賣邊界)", baseline_price=current_base_price), use_container_width=True, config=chart_config, key="c1")
     with col2:
         if not df_5m.empty:
-            # 傳入 baseline_price 畫線
             st.plotly_chart(plot_advanced_candlestick(df_5m, "5 分鐘線 (預測結算目標區)", baseline_price=current_base_price), use_container_width=True, config=chart_config, key="c5")
     with col3:
         if not df_15m.empty:
             st.plotly_chart(plot_advanced_candlestick(df_15m, "15 分鐘線 (確認主力大趨勢)"), use_container_width=True, config=chart_config, key="c15")
 
-show_prediction_dashboard(symbol)
+show_prediction_dashboard(symbol, available_symbols)
