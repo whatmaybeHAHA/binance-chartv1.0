@@ -99,7 +99,7 @@ st.title("🎯 Binance Predict 5分鐘勝率提升器")
 
 col_setting, col_price, col_info = st.columns([1.5, 1.5, 2])
 with col_setting:
-    symbol = st.selectbox("選擇預測交易對", ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"])
+    symbol = st.selectbox("選擇預測交易對", ["BTCUSDT", "ETHUSDT", "BNBUSDT"])
 
 @st.fragment(run_every=1)
 def show_realtime_price(selected_symbol):
