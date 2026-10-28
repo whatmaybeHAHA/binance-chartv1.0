@@ -77,16 +77,27 @@ with col_info:
 # 獨立區塊 1：每 1 秒自動更新的即時報價
 @st.fragment(run_every=1)
 def show_realtime_price(selected_symbol):
-    # 改用幣安專屬的極輕量 Ticker API，每秒抓取也不會被封鎖
     url = "https://data-api.binance.vision/api/v3/ticker/price"
     params = {"symbol": selected_symbol}
     try:
         res = requests.get(url, params=params).json()
         current_price = float(res['price'])
-        # 顯示價格，並自動加上千位數逗號與兩位小數
-        st.metric(label=f"💰 {selected_symbol} 最新即時報價", value=f"{current_price:,.2f}")
+        
+        # 取得系統抓到資料當下的時間，並轉換為台灣時間 (UTC+8)
+        update_time = (pd.Timestamp.utcnow() + pd.Timedelta(hours=8)).strftime('%H:%M:%S')
+        
+        # 顯示價格，並在標題加入綠燈與秒數
+        st.metric(
+            label=f"💰 {selected_symbol} 即時報價 ｜ 🟢 最新更新: {update_time}", 
+            value=f"{current_price:,.2f}"
+        )
     except:
-        st.metric(label=f"💰 {selected_symbol} 最新即時報價", value="載入中...")
+        update_time = (pd.Timestamp.utcnow() + pd.Timedelta(hours=8)).strftime('%H:%M:%S')
+        # 若抓取失敗則顯示紅燈與失敗時間
+        st.metric(
+            label=f"💰 {selected_symbol} 即時報價 ｜ 🔴 連線中斷: {update_time}", 
+            value="載入中..."
+        )
 
 # 獨立區塊 2：每 10 秒自動更新的多時框圖表
 @st.fragment(run_every=10)
