@@ -15,6 +15,8 @@ def play_alert_sound():
     """
     st.markdown(audio_html, unsafe_allow_html=True)
 
+# 🌟 加入 @st.cache_data(ttl=5)，快取 5 秒內的 API 資料，大幅提升切換速度！
+@st.cache_data(ttl=5)
 def get_binance_klines(symbol, interval, limit=150):
     url = "https://data-api.binance.vision/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -103,7 +105,8 @@ def generate_prediction_signal(df_1m, df_5m, df_15m):
     
     now = pd.Timestamp.utcnow() + pd.Timedelta(hours=8)
     next_5m = now.ceil('5min')
-    if next_5m == now: next_5m = now + pd.Timedelta(minutes=5)
+    if next_5m == now: 
+        next_5m = now + pd.Timedelta(minutes=5)
     sec_left = int((next_5m - now).total_seconds())
     min_str = sec_left // 60
     sec_str = sec_left % 60
@@ -180,7 +183,6 @@ def plot_advanced_candlestick(df, title, baseline_price=None):
 # --- 網頁介面設計 ---
 st.title("🎯 Binance Predict 5分鐘勝率提升器")
 
-# 🌟 已經將 SOLUSDT 移除
 available_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 col_setting, col_price, col_info = st.columns([1.5, 1.5, 2])
@@ -217,18 +219,15 @@ def show_prediction_dashboard(selected_symbol, all_symbols):
     radar_messages = []
     
     for osym in other_symbols:
-        # 為了提升速度，限制只抓取 100 根 K 線進行計算即可
         d1 = add_technical_indicators(get_binance_klines(osym, "1m", limit=100))
         d5 = add_technical_indicators(get_binance_klines(osym, "5m", limit=100))
         d15 = add_technical_indicators(get_binance_klines(osym, "15m", limit=100))
-        # 轉換名稱顯示，例如把 BTCUSDT 變成 BTC
         clean_name = osym.replace("USDT", "") 
         radar_msg = generate_radar_signal(d1, d5, d15, clean_name)
         radar_messages.append(radar_msg)
     
-    # 顯示雷達跑馬燈
     st.markdown(f"📡 **背景靜音雷達：** {' ｜ '.join(radar_messages)}")
-    st.divider() # 加一條分隔線區隔雷達與主戰場
+    st.divider()
     
     # --- 2. 主戰場資料抓取與訊號判定 (有聲音) ---
     df_1m = add_technical_indicators(get_binance_klines(selected_symbol, "1m"))
