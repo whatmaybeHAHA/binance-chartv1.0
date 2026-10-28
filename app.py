@@ -48,6 +48,7 @@ def plot_candlestick(df, title):
         margin=dict(l=10, r=10, t=55, b=10),
         height=450,
         template="plotly_dark",
+        uirevision=title,  # ✨ 魔法參數：記住使用者的縮放與平移視角
         annotations=[dict(
             text=f"📅 {latest_date}",
             xref="paper", yref="paper",
@@ -108,7 +109,7 @@ def show_charts(selected_symbol):
     chart_config = {'locale': 'zh-TW'}
     
     with col1:
-        df_1m = get_binance_klines(selected_symbol, "1m", limit=50)
+        df_1m = get_binance_klines(selected_symbol, "1m", limit=200)
         if not df_1m.empty:
             st.plotly_chart(
                 plot_candlestick(df_1m, "1 分鐘線 (確認進場點)"), 
@@ -117,7 +118,7 @@ def show_charts(selected_symbol):
             )
 
     with col2:
-        df_5m = get_binance_klines(selected_symbol, "5m", limit=50)
+        df_5m = get_binance_klines(selected_symbol, "5m", limit=200)
         if not df_5m.empty:
             st.plotly_chart(
                 plot_candlestick(df_5m, "5 分鐘線 (尋找型態與支撐壓力)"), 
@@ -126,7 +127,7 @@ def show_charts(selected_symbol):
             )
 
     with col3:
-        df_15m = get_binance_klines(selected_symbol, "15m", limit=50)
+        df_15m = get_binance_klines(selected_symbol, "15m", limit=200)
         if not df_15m.empty:
             st.plotly_chart(
                 plot_candlestick(df_15m, "15 分鐘線 (確認大趨勢方向)"), 
