@@ -130,4 +130,138 @@ def generate_prediction_signal(df_1m, df_5m, df_15m):
         elif rsi_1m < 30 and price_diff < 0:
             return f"⏱️ 【剩餘 {countdown}】 ⚠️ 潛在逆轉 (UP) - 極度超賣！有機會向上反彈衝出水面 {base_price}。", "warning"
         elif rsi_1m > 70 and price_diff > 0:
-            return f"⏱️ 【剩餘 {countdown}】 ⚠️ 潛在逆轉 (DOWN) - 極度
+            return f"⏱️ 【剩餘 {countdown}】 ⚠️ 潛在逆轉 (DOWN) - 極度超買！有機會向下回落跌破水面 {base_price}。", "warning"
+        else:
+            return f"⏱️ 【剩餘 {countdown}】 ⚖️ 觀望 - 價格在基準水面 {base_price} 附近隨機震盪，等待邊界訊號。", "info"
+
+def plot_advanced_candlestick(df, title, baseline_price=None):
+    latest_date = df['Open time'].iloc[-1].strftime('%Y-%m-%d')
+    latest_rsi = df['RSI'].iloc[-1]
+    fig = go.Figure()
+    
+    fig.add_trace(go.Candlestick(
+        x=df['Open time'], open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
+        name="K線", increasing_line_color='#26A69A', decreasing_line_color='#EF5350'
+    ))
+    
+    fig.add_trace(go.Scatter(x=df['Open time'], y=df['MA5'], line=dict(color='#FBC02D', width=1.5), name='5MA'))
+    fig.add_trace(go.Scatter(x=df['Open time'], y=df['MA20'], line=dict(color='#AB47BC', width=1.5), name='20MA'))
+    fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Upper'], line=dict(color='rgba(33, 150, 243, 0.6)', width=1.5, dash='dot'), name='布林上軌'))
+    fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Lower'], line=dict(color='rgba(33, 150, 243, 0.6)', width=1.5, dash='dot'), name='布林下軌'))
+    
+    if baseline_price is not None:
+        fig.add_hline(
+            y=baseline_price, 
+            line_dash="dash", 
+            line_color="#FFFFFF", 
+            line_width=2,
+            opacity=0.9,
+            annotation_text=f"🎯 基準水面", 
+            annotation_position="bottom right",
+            annotation_font_color="white",
+            annotation_font_size=13
+        )
+    
+    fig.update_layout(
+        title=dict(text=f"{title} | RSI: {latest_rsi:.1f}", font=dict(size=16)),
+        xaxis_rangeslider_visible=False,
+        margin=dict(l=10, r=10, t=40, b=60),
+        height=450,
+        template="plotly_dark",
+        uirevision="constant",
+        annotations=[dict(
+            text=f"📅 {latest_date}", xref="paper", yref="paper", x=1.0, y=1.05,
+            xanchor="right", yanchor="bottom", showarrow=False, font=dict(size=12, color="#AAAAAA")
+        )],
+        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5)
+    )
+    
+    fig.update_xaxes(tickangle=-45, nticks=8, tickformat="%H:%M") 
+    fig.update_xaxes(range=[df['Open time'].iloc[-80], df['Open time'].iloc[-1]])
+    return fig
+
+# --- 網頁介面設計 ---
+st.title("🎯 Binance Predict 5分鐘勝率提升器")
+
+available_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
+
+col_setting, col_price, col_info = st.columns([1.5, 1.5, 2])
+with col_setting:
+    symbol = st.selectbox("選擇主戰場 (發出音效)", available_symbols)
+
+@st.fragment(run_every=1)
+def show_realtime_price(selected_symbol):
+    url = "https://data-api.binance.vision/api/v3/ticker/price"
+    try:
+        res = requests.get(url, params={"symbol": selected_symbol}).json()
+        current_price = float(res['price'])
+        
+        now = pd.Timestamp.utcnow() + pd.Timedelta(hours=8)
+        next_5m = now.ceil('5min')
+        if next_5m == now: next_5m = now + pd.Timedelta(minutes=5)
+        sec_left = int((next_5m - now).total_seconds())
+        countdown = f"{sec_left // 60:02d}:{sec_left % 60:02d}"
+        
+        st.metric(label=f"💰 {selected_symbol} 即時現價 ｜ ⏳ 距離結算倒數: {countdown}", value=f"{current_price:,.2f}")
+    except:
+        st.metric(label="連線狀態", value="載入中...")
+
+with col_price:
+    show_realtime_price(symbol)
+    
+with col_info:
+    st.info("💡 實戰口訣：重點關注【倒數 1 分鐘】內的保衛戰訊號，勝率最高！")
+
+@st.fragment(run_every=10)
+def show_prediction_dashboard(selected_symbol, all_symbols):
+    # --- 1. 背景靜音雷達 (使用 ThreadPoolExecutor 進行平行多執行緒抓取，秒速完成) ---
+    other_symbols = [s for s in all_symbols if s != selected_symbol]
+    
+    def fetch_radar_data(osym):
+        d1 = add_technical_indicators(get_binance_klines(osym, "1m", limit=100))
+        d5 = add_technical_indicators(get_binance_klines(osym, "5m", limit=100))
+        d15 = add_technical_indicators(get_binance_klines(osym, "15m", limit=100))
+        clean_name = osym.replace("USDT", "") 
+        return generate_radar_signal(d1, d5, d15, clean_name)
+
+    # 同時向幣安請求其他幣種資料
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        radar_messages = list(executor.map(fetch_radar_data, other_symbols))
+    
+    st.markdown(f"📡 **背景靜音雷達：** {' ｜ '.join(radar_messages)}")
+    st.divider()
+    
+    # --- 2. 主戰場資料抓取與訊號判定 (有聲音) ---
+    df_1m = add_technical_indicators(get_binance_klines(selected_symbol, "1m"))
+    df_5m = add_technical_indicators(get_binance_klines(selected_symbol, "5m"))
+    df_15m = add_technical_indicators(get_binance_klines(selected_symbol, "15m"))
+    
+    signal_text, signal_type = generate_prediction_signal(df_1m, df_5m, df_15m)
+    
+    if signal_type == "success":
+        st.success(signal_text)
+        play_alert_sound()
+    elif signal_type == "error":
+        st.error(signal_text)
+        play_alert_sound()
+    elif signal_type == "warning":
+        st.warning(signal_text)
+    else:
+        st.info(signal_text)
+    
+    current_base_price = df_5m.iloc[-1]['Open'] if not df_5m.empty else None
+    
+    col1, col2, col3 = st.columns(3)
+    chart_config = {'displayModeBar': False, 'scrollZoom': True}
+    
+    with col1:
+        if not df_1m.empty:
+            st.plotly_chart(plot_advanced_candlestick(df_1m, "1 分鐘線 (尋找超買超賣邊界)", baseline_price=current_base_price), use_container_width=True, config=chart_config, key="c1")
+    with col2:
+        if not df_5m.empty:
+            st.plotly_chart(plot_advanced_candlestick(df_5m, "5 分鐘線 (預測結算目標區)", baseline_price=current_base_price), use_container_width=True, config=chart_config, key="c5")
+    with col3:
+        if not df_15m.empty:
+            st.plotly_chart(plot_advanced_candlestick(df_15m, "15 分鐘線 (確認主力大趨勢)"), use_container_width=True, config=chart_config, key="c15")
+
+show_prediction_dashboard(symbol, available_symbols)
