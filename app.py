@@ -93,30 +93,6 @@ def show_realtime_price(selected_symbol):
 def show_charts(selected_symbol):
     col1, col2, col3 = st.columns(3)
     
-    with col1:
-        df_1m = get_binance_klines(selected_symbol, "1m", limit=50)
-        if not df_1m.empty:
-            st.plotly_chart(plot_candlestick(df_1m, "1 分鐘線 (確認進場點)"), use_container_width=True, config={'locale': 'zh-TW'})
-
-    with col2:
-        df_5m = get_binance_klines(selected_symbol, "5m", limit=50)
-        if not df_5m.empty:
-            st.plotly_chart(plot_candlestick(df_5m, "5 分鐘線 (尋找型態與支撐壓力)"), use_container_width=True, config={'locale': 'zh-TW'})
-
-    with col3:
-        df_15m = get_binance_klines(selected_symbol, "15m", limit=50)
-        if not df_15m.empty:
-            st.plotly_chart(plot_candlestick(df_15m, "15 分鐘線 (確認大趨勢方向)"), use_container_width=True, config={'locale': 'zh-TW'}
-                           )
-# 執行區塊
-with col_price:
-    show_realtime_price(symbol)
-
-# 獨立區塊 2：每 10 秒自動更新的多時框圖表
-@st.fragment(run_every=10)
-def show_charts(selected_symbol):
-    col1, col2, col3 = st.columns(3)
-    
     # 建立圖表專用的設定檔，將語系設定為繁體中文
     chart_config = {'locale': 'zh-TW'}
     
@@ -126,7 +102,7 @@ def show_charts(selected_symbol):
             st.plotly_chart(
                 plot_candlestick(df_1m, "1 分鐘線 (確認進場點)"), 
                 use_container_width=True,
-                config=chart_config  # 加入這行來轉換語言
+                config=chart_config
             )
 
     with col2:
@@ -135,7 +111,7 @@ def show_charts(selected_symbol):
             st.plotly_chart(
                 plot_candlestick(df_5m, "5 分鐘線 (尋找型態與支撐壓力)"), 
                 use_container_width=True,
-                config=chart_config  # 加入這行來轉換語言
+                config=chart_config
             )
 
     with col3:
@@ -144,5 +120,12 @@ def show_charts(selected_symbol):
             st.plotly_chart(
                 plot_candlestick(df_15m, "15 分鐘線 (確認大趨勢方向)"), 
                 use_container_width=True,
-                config=chart_config  # 加入這行來轉換語言
+                config=chart_config
             )
+
+# --- 執行區塊 ---
+with col_price:
+    show_realtime_price(symbol)
+
+# 呼叫並畫出圖表 (原本遺漏的指令)
+show_charts(symbol)
