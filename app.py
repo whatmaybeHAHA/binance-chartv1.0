@@ -74,7 +74,7 @@ def plot_advanced_candlestick(df, title):
     fig.add_trace(go.Scatter(x=df['Open time'], y=df['MA5'], line=dict(color='#FBC02D', width=1.5), name='5MA'))
     fig.add_trace(go.Scatter(x=df['Open time'], y=df['MA20'], line=dict(color='#AB47BC', width=1.5), name='20MA'))
     fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Upper'], line=dict(color='rgba(33, 150, 243, 0.6)', width=1, dash='dot'), name='布林上軌'))
-    fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Lower'], line=dict(color='rgba((33, 150, 243, 0.6)', width=1, dash='dot'), name='布林下軌'))
+    fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Lower'], line=dict(color='rgba(33, 150, 243, 0.6)', width=1, dash='dot'), name='布林下軌'))
     
     fig.update_layout(
         title=dict(text=f"{title} | RSI: {latest_rsi:.1f}", font=dict(size=16)),
