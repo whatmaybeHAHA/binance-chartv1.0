@@ -96,10 +96,11 @@ def plot_advanced_candlestick(df, title):
     fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Upper'], line=dict(color='rgba(255, 255, 255, 0.3)', width=1, dash='dot'), name='布林上軌'))
     fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Lower'], line=dict(color='rgba(255, 255, 255, 0.3)', width=1, dash='dot'), name='布林下軌'))
     
-    fig.update_layout(
+fig.update_layout(
         title=dict(text=f"{title} | RSI: {latest_rsi:.1f}", font=dict(size=16)),
         xaxis_rangeslider_visible=False,
-        margin=dict(l=10, r=10, t=40, b=10),
+        # 將底部邊距 (b) 從 10 增加到 60，留出空間給圖例
+        margin=dict(l=10, r=10, t=40, b=60), 
         height=450,
         template="plotly_dark",
         uirevision="constant",
@@ -107,7 +108,8 @@ def plot_advanced_candlestick(df, title):
             text=f"📅 {latest_date}", xref="paper", yref="paper", x=1.0, y=1.05,
             xanchor="right", yanchor="bottom", showarrow=False, font=dict(size=12, color="#AAAAAA")
         )],
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        # 修改這裡：將圖例移到圖表底部 (y=-0.2) 並置中 (x=0.5)
+        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5) 
     )
     
     fig.update_xaxes(tickangle=-45, nticks=8, tickformat="%H:%M") 
