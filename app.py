@@ -7,7 +7,7 @@ import concurrent.futures
 
 st.set_page_config(layout="wide", page_title="幣安 5 分鐘預測高勝率看盤系統 - 終極戰術版")
 
-# 🌟 新增：注入 CSS 來強制放大 Checkbox 按鈕與文字
+# 🌟 注入 CSS 強制放大 Checkbox 按鈕與文字
 st.markdown("""
 <style>
 div[data-testid="stCheckbox"] label span {
@@ -29,7 +29,6 @@ with st.sidebar:
     rsi_long_th = st.slider("⚡ 搶反彈 (買漲) RSI 觸發門檻", min_value=15, max_value=45, value=30, step=1, help="當價格跌穿下軌，且 RSI 低於此數值時觸發買漲。")
     rsi_short_th = st.slider("⚡ 摸頭空 (買跌) RSI 觸發門檻", min_value=55, max_value=85, value=70, step=1, help="當價格突破上軌，且 RSI 高於此數值時觸發買跌。")
     st.divider()
-    # 🌟 新增：牛市與熊市的雙向提示
     st.info("""
     💡 **實戰參數調整提示：**
     
@@ -41,13 +40,11 @@ with st.sidebar:
     """)
 
 def play_alert_sound(signal_mode="trend"):
-    """根據戰術模式播放不同的提示音 (強制更新時間戳記)"""
+    """根據戰術模式播放不同的提示音"""
     t = pd.Timestamp.now().timestamp()
     if signal_mode == "rebound":
-        # 搶反彈專屬音效：警報鈴聲
         audio_url = f"https://actions.google.com/sounds/v1/alarms/bugle_tune.ogg?v={t}"
     else:
-        # 順勢與保衛戰音效：清脆短嗶聲
         audio_url = f"https://actions.google.com/sounds/v1/alarms/beep_short.ogg?v={t}"
         
     audio_html = f"""
@@ -125,6 +122,10 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
     bb_upper = latest_1m['BB_Upper']
     bb_lower = latest_1m['BB_Lower']
     
+    # 🌟 判斷是否落入「死亡糾纏區」 (價差極小，不到 0.2 倍 ATR)
+    in_dead_zone = abs(price_diff) < (0.2 * atr_1m)
+    
+    # ⚡ 戰術 B：極端搶反彈 (最高優先級)
     if enable_rebound:
         if current_price <= bb_lower and rsi_1m <= rsi_long_th:
             score = min(85.0 + (rsi_long_th - rsi_1m), 99.0)
@@ -136,6 +137,22 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
             desc = f"⚡ 【極端回落】 買跌 (DOWN) ｜ 貫穿上軌 ＋ RSI極度貪婪 ({rsi_1m:.1f})"
             return score, desc, "error", moat_ratio, base_price, "rebound"
 
+    # 🛑 戰術 C：死亡糾纏區處理 (打破邊界僵局)
+    if in_dead_zone:
+        if trend_up and rsi_1m > 55:
+            score = 62.0
+            desc = f"📈 【倒數 {countdown}】 蓄勢買漲 (UP) ｜ 糾纏區待突破 ({moat_ratio:.2f}x ATR)"
+            return score, desc, "warning", moat_ratio, base_price, "trend"
+        elif not trend_up and rsi_1m < 45:
+            score = 62.0
+            desc = f"📉 【倒數 {countdown}】 蓄勢買跌 (DOWN) ｜ 糾纏區待跌破 ({moat_ratio:.2f}x ATR)"
+            return score, desc, "warning", moat_ratio, base_price, "trend"
+        else:
+            score = 45.0
+            desc = f"⚖️ 【倒數 {countdown}】 無方向震盪 ｜ 死亡糾纏區，指標混亂強制觀望"
+            return score, desc, "info", moat_ratio, base_price, "trend"
+
+    # 🛡️ 戰術 A：常規順勢與保衛戰
     score = 50.0 
     direction = "UP" if price_diff >= 0 else "DOWN"
     
@@ -160,8 +177,18 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
         elif rsi_1m < 25: score -= 15.0  
         elif rsi_1m > 60: score -= 15.0
 
-    if direction == "UP" and current_price >= bb_upper: score -= 12.0  
-    elif direction == "DOWN" and current_price <= bb_lower: score -= 12.0  
+    # 🛡️ 動態時間防禦機制 (布林邊界修正)
+    is_touch_upper = current_price >= bb_upper
+    is_touch_lower = current_price <= bb_lower
+    
+    if sec_left <= 60:
+        # 倒數 60 秒生死戰：零容錯率，只要觸碰邊界一律重罰
+        if direction == "UP" and is_touch_upper: score -= 12.0
+        elif direction == "DOWN" and is_touch_lower: score -= 12.0
+    else:
+        # 前 4 分鐘佈局期：僅在 RSI 過熱時才視為假突破重罰，容許良性突破
+        if direction == "UP" and is_touch_upper and rsi_1m > 75: score -= 12.0
+        elif direction == "DOWN" and is_touch_lower and rsi_1m < 25: score -= 12.0
 
     score = float(np.clip(score, 5.0, 98.0))
     
@@ -259,7 +286,6 @@ with col_price:
 
 @st.fragment(run_every=10)
 def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag, r_long, r_short):
-    # 1. 平行背景雷達
     other_symbols = [s for s in all_symbols if s != selected_symbol]
     def fetch_radar(osym):
         d1 = add_technical_indicators(get_binance_klines(osym, "1m", limit=80))
@@ -270,7 +296,6 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
     with concurrent.futures.ThreadPoolExecutor() as executor:
         radar_messages = list(executor.map(fetch_radar, other_symbols))
     
-    # 🌟 修改點 1 & 2：將雷達改為靠左對齊 (text-align: left)
     st.markdown(f"<div style='text-align: left; font-size: 16px; margin-top: 10px; margin-bottom: 2px; color: #CCCCCC;'>📡 <b>背景靜音雷達：</b> {' ｜ '.join(radar_messages)}</div>", unsafe_allow_html=True)
     
     df_1m = add_technical_indicators(get_binance_klines(selected_symbol, "1m"))
@@ -281,7 +306,6 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
     
     score_color = "#4FC3F7" if score >= 80 else ("#FFD54F" if score >= 65 else "#9E9E9E")
     
-    # 🌟 修改點 1 & 2：將分數改為靠左對齊，並將字體縮小至適中的 24px
     st.markdown(f"<div style='text-align: left; font-size: 24px; font-weight: bold; color: {score_color}; margin-top: 0px; margin-bottom: 15px;'>🎯 勝率信心指數：{score:.1f}%</div>", unsafe_allow_html=True)
     
     if status_type == "success":
@@ -312,22 +336,23 @@ with st.expander("📖 系統戰術與量化判斷邏輯 (點擊展開)"):
     st.markdown("""
     ### 🔥 戰術 A：順勢與保衛戰 (基礎 50 分)
     *   **時間權重：** 進入最後 1 分鐘 `+15分`，最後 30 秒再 `+10分`。
-    *   **護城河權重 (價差 ÷ 1分ATR)：** 
-        *   大於 1.5 倍 ATR `+25分`
-        *   大於 1.0 倍 ATR `+18分`
-        *   大於 0.5 倍 ATR `+8分`
-        *   貼近基準線或低於水面 `重罰 -20分` (極度危險)。
-    *   **布林通道防禦：** 順勢買漲時若現價大於「布林上軌」，或買跌時小於「布林下軌」，視為阻力/支撐極限，強制 `-12分`。
-    *   **音效：** 清脆短嗶聲 (Beep)。
+    *   **護城河權重 (價差 ÷ 1分ATR)：** 大於 1.5 倍 ATR `+25分`；大於 1.0 倍 ATR `+18分`；大於 0.5 倍 ATR `+8分`；貼近基準線或低於水面 `重罰 -20分`。
+    
+    ### ⏳ 動態時間防禦機制 (布林邊界)
+    *   **前 4 分鐘佈局期：** 觸碰布林邊界時，僅在 RSI 過熱 (>75 或 <25) 時扣 12 分，容許良性突破。
+    *   **最後 60 秒保衛戰：** 零容錯率，只要觸碰布林邊界，無視 RSI 無條件扣 12 分。
+
+    ### 🛡️ 戰術 C：死亡糾纏區 (邊界僵局處理)
+    *   **觸發條件：** 當前價差小於 0.2 倍 ATR (極度貼近基準線)。
+    *   **判定邏輯：** 暫停計算傳統護城河，改看短線 RSI 推力與大趨勢方向。
+    *   **給分：** 動能一致時給予 62 分 (蓄勢黃燈)，動能混亂時給予 45 分 (無方向藍燈強制觀望)。
 
     ### ⚡ 戰術 B：極端搶反彈 (獨立高分通道)
-    *   **觸發條件 (買漲)：** 價格貫穿布林下軌 ＋ RSI 低於側邊欄設定門檻。
-    *   **觸發條件 (買跌)：** 價格貫穿布林上軌 ＋ RSI 高於側邊欄設定門檻。
-    *   **給分邏輯：** 觸發後基礎給予 85 分，RSI 越恐慌/貪婪，分數越高 (最高 99%)。無視護城河深度。
-    *   **音效：** 警報鈴聲 (Alarm Chime)。
+    *   **觸發條件：** 價格貫穿布林上下軌 ＋ RSI 超越側邊欄設定門檻。
+    *   **給分邏輯：** 無視護城河深度，觸發基礎即給予 85 分，情緒越極端分數越高 (最高 99%)。
 
     ### 🎯 燈號對照表
-    *   🟢 **80% ~ 100% (高勝率)：** 滿足極端反彈條件，或順勢保衛戰擁有極深護城河。觸發音效，建議進場主力倉位。
-    *   🟡 **65% ~ 79% (順勢觀察)：** 趨勢正確但護城河尚淺。不觸發音效，建議輕倉跟隨或觀望最後 30 秒變化。
-    *   ⚪ **低於 65% (震盪觀望)：** 距離基準水面過近，隨時可能遭反殺，強制觀望。
+    *   🟢 **80% ~ 100% (高勝率)：** 觸發音效，建議進場主力倉位。
+    *   🟡 **65% ~ 79% (順勢觀察)：** 不觸發音效，建議輕倉跟隨或觀望最後 30 秒變化。
+    *   ⚪ **低於 65% (震盪觀望)：** 強制觀望，嚴禁下單。
     """)
