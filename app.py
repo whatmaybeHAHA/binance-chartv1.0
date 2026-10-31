@@ -7,6 +7,21 @@ import concurrent.futures
 
 st.set_page_config(layout="wide", page_title="幣安 5 分鐘預測高勝率看盤系統 - 終極戰術版")
 
+# 🌟 新增：注入 CSS 來強制放大 Checkbox 按鈕與文字
+st.markdown("""
+<style>
+div[data-testid="stCheckbox"] label span {
+    font-size: 18px !important;
+    font-weight: bold;
+    color: #E0E0E0;
+}
+div[data-testid="stCheckbox"] label div[role="checkbox"] {
+    transform: scale(1.3);
+    margin-right: 10px;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # --- 側邊欄：戰術參數微調 ---
 with st.sidebar:
     st.header("⚙️ 戰術參數微調")
@@ -14,7 +29,16 @@ with st.sidebar:
     rsi_long_th = st.slider("⚡ 搶反彈 (買漲) RSI 觸發門檻", min_value=15, max_value=45, value=30, step=1, help="當價格跌穿下軌，且 RSI 低於此數值時觸發買漲。")
     rsi_short_th = st.slider("⚡ 摸頭空 (買跌) RSI 觸發門檻", min_value=55, max_value=85, value=70, step=1, help="當價格突破上軌，且 RSI 高於此數值時觸發買跌。")
     st.divider()
-    st.info("💡 提示：在狂暴牛市中，建議將「摸頭空」的門檻調高至 80 以上，避免被嘎空。")
+    # 🌟 新增：牛市與熊市的雙向提示
+    st.info("""
+    💡 **實戰參數調整提示：**
+    
+    🐂 **狂暴牛市**：
+    建議將「摸頭空」門檻調高至 80 以上，避免被強勢多頭嘎空。
+    
+    🐻 **絕望熊市**：
+    建議將「搶反彈(買漲)」門檻調低至 20 以下，避免在無量暴跌時接刀破底。
+    """)
 
 def play_alert_sound(signal_mode="trend"):
     """根據戰術模式播放不同的提示音 (強制更新時間戳記)"""
@@ -101,7 +125,6 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
     bb_upper = latest_1m['BB_Upper']
     bb_lower = latest_1m['BB_Lower']
     
-    # 🌟 戰術 B：極端搶反彈 (高優先級)
     if enable_rebound:
         if current_price <= bb_lower and rsi_1m <= rsi_long_th:
             score = min(85.0 + (rsi_long_th - rsi_1m), 99.0)
@@ -113,7 +136,6 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
             desc = f"⚡ 【極端回落】 買跌 (DOWN) ｜ 貫穿上軌 ＋ RSI極度貪婪 ({rsi_1m:.1f})"
             return score, desc, "error", moat_ratio, base_price, "rebound"
 
-    # 🛡️ 戰術 A：常規順勢與保衛戰
     score = 50.0 
     direction = "UP" if price_diff >= 0 else "DOWN"
     
@@ -248,8 +270,8 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
     with concurrent.futures.ThreadPoolExecutor() as executor:
         radar_messages = list(executor.map(fetch_radar, other_symbols))
     
-    # 排版優化：緊湊靠攏，無進度條
-    st.markdown(f"<div style='text-align: center; font-size: 16px; margin-top: 10px; margin-bottom: -5px; color: #CCCCCC;'>📡 <b>背景靜音雷達：</b> {' ｜ '.join(radar_messages)}</div>", unsafe_allow_html=True)
+    # 🌟 修改點 1 & 2：將雷達改為靠左對齊 (text-align: left)
+    st.markdown(f"<div style='text-align: left; font-size: 16px; margin-top: 10px; margin-bottom: 2px; color: #CCCCCC;'>📡 <b>背景靜音雷達：</b> {' ｜ '.join(radar_messages)}</div>", unsafe_allow_html=True)
     
     df_1m = add_technical_indicators(get_binance_klines(selected_symbol, "1m"))
     df_5m = add_technical_indicators(get_binance_klines(selected_symbol, "5m"))
@@ -258,7 +280,9 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
     score, desc_text, status_type, moat_ratio, base_price, signal_mode = calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound_flag, r_long, r_short)
     
     score_color = "#4FC3F7" if score >= 80 else ("#FFD54F" if score >= 65 else "#9E9E9E")
-    st.markdown(f"<h1 style='text-align: center; color: {score_color}; margin-top: 0px; margin-bottom: 10px;'>🎯 勝率信心指數：{score:.1f}%</h1>", unsafe_allow_html=True)
+    
+    # 🌟 修改點 1 & 2：將分數改為靠左對齊，並將字體縮小至適中的 24px
+    st.markdown(f"<div style='text-align: left; font-size: 24px; font-weight: bold; color: {score_color}; margin-top: 0px; margin-bottom: 15px;'>🎯 勝率信心指數：{score:.1f}%</div>", unsafe_allow_html=True)
     
     if status_type == "success":
         st.success(desc_text)
