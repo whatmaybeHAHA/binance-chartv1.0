@@ -122,10 +122,8 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
     bb_upper = latest_1m['BB_Upper']
     bb_lower = latest_1m['BB_Lower']
     
-    # 🌟 判斷是否落入「死亡糾纏區」 (價差極小，不到 0.2 倍 ATR)
     in_dead_zone = abs(price_diff) < (0.2 * atr_1m)
     
-    # ⚡ 戰術 B：極端搶反彈 (最高優先級)
     if enable_rebound:
         if current_price <= bb_lower and rsi_1m <= rsi_long_th:
             score = min(85.0 + (rsi_long_th - rsi_1m), 99.0)
@@ -137,7 +135,6 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
             desc = f"⚡ 【極端回落】 買跌 (DOWN) ｜ 貫穿上軌 ＋ RSI極度貪婪 ({rsi_1m:.1f})"
             return score, desc, "error", moat_ratio, base_price, "rebound"
 
-    # 🛑 戰術 C：死亡糾纏區處理 (打破邊界僵局)
     if in_dead_zone:
         if trend_up and rsi_1m > 55:
             score = 62.0
@@ -152,7 +149,6 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
             desc = f"⚖️ 【倒數 {countdown}】 無方向震盪 ｜ 死亡糾纏區，指標混亂強制觀望"
             return score, desc, "info", moat_ratio, base_price, "trend"
 
-    # 🛡️ 戰術 A：常規順勢與保衛戰
     score = 50.0 
     direction = "UP" if price_diff >= 0 else "DOWN"
     
@@ -177,16 +173,13 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
         elif rsi_1m < 25: score -= 15.0  
         elif rsi_1m > 60: score -= 15.0
 
-    # 🛡️ 動態時間防禦機制 (布林邊界修正)
     is_touch_upper = current_price >= bb_upper
     is_touch_lower = current_price <= bb_lower
     
     if sec_left <= 60:
-        # 倒數 60 秒生死戰：零容錯率，只要觸碰邊界一律重罰
         if direction == "UP" and is_touch_upper: score -= 12.0
         elif direction == "DOWN" and is_touch_lower: score -= 12.0
     else:
-        # 前 4 分鐘佈局期：僅在 RSI 過熱時才視為假突破重罰，容許良性突破
         if direction == "UP" and is_touch_upper and rsi_1m > 75: score -= 12.0
         elif direction == "DOWN" and is_touch_lower and rsi_1m < 25: score -= 12.0
 
@@ -197,9 +190,13 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
         action = "🔥 買漲 (UP)" if direction == "UP" else "🔥 買跌 (DOWN)"
         desc = f"【倒數 {countdown}】 訊號：{action} ｜ 護城河倍數: {moat_ratio:.2f}x ATR"
     elif score >= 65:
+        # 🌟 修正點：依照護城河的實際厚度，給予不同的黃燈警告文字
         status_type = "warning"
         action = "買漲 (UP)" if direction == "UP" else "買跌 (DOWN)"
-        desc = f"⚠️ 【倒數 {countdown}】 訊號：{action} 順勢觀察 ｜ 護城河薄弱 ({moat_ratio:.2f}x ATR)"
+        if moat_ratio >= 1.0:
+            desc = f"⚠️ 【倒數 {countdown}】 訊號：{action} 順勢觀察 ｜ 護城河安全 ({moat_ratio:.2f}x ATR)，但動能中性待發酵"
+        else:
+            desc = f"⚠️ 【倒數 {countdown}】 訊號：{action} 順勢觀察 ｜ 護城河薄弱 ({moat_ratio:.2f}x ATR)"
     else:
         status_type = "info"
         desc = f"⏳ 【倒數 {countdown}】 震盪觀望 ｜ 距水面過近或指標背離"
@@ -353,6 +350,6 @@ with st.expander("📖 系統戰術與量化判斷邏輯 (點擊展開)"):
 
     ### 🎯 燈號對照表
     *   🟢 **80% ~ 100% (高勝率)：** 觸發音效，建議進場主力倉位。
-    *   🟡 **65% ~ 79% (順勢觀察)：** 不觸發音效，建議輕倉跟隨或觀望最後 30 秒變化。
+    *   🟡 **65% ~ 79% (順勢觀察)：** 不觸發音效，留意護城河是否足夠或動能是否發酵。建議輕倉跟隨或觀望。
     *   ⚪ **低於 65% (震盪觀望)：** 強制觀望，嚴禁下單。
     """)
