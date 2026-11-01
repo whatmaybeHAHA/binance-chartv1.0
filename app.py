@@ -5,19 +5,21 @@ import requests
 import plotly.graph_objects as go
 import concurrent.futures
 
-st.set_page_config(layout="wide", page_title="幣安 5 分鐘預測高勝率看盤系統 - 終極戰術版")
+st.set_page_config(layout="wide", page_title="幣安 5 分鐘預測高勝率看盤系統 - 雷達音效版")
 
-# 🌟 注入 CSS 強制放大 Checkbox 按鈕與文字
+# 🌟 1. 強制放大 Checkbox 容器與改變字體顏色
 st.markdown("""
 <style>
-div[data-testid="stCheckbox"] label span {
-    font-size: 18px !important;
-    font-weight: bold;
-    color: #E0E0E0;
-}
-div[data-testid="stCheckbox"] label div[role="checkbox"] {
+div[data-testid="stCheckbox"] {
     transform: scale(1.3);
-    margin-right: 10px;
+    transform-origin: left center;
+    padding-top: 8px;
+    padding-bottom: 8px;
+}
+div[data-testid="stCheckbox"] label p {
+    font-size: 16px !important;
+    font-weight: bold !important;
+    color: #FFCA28 !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -29,8 +31,12 @@ with st.sidebar:
     rsi_long_th = st.slider("⚡ 搶反彈 (買漲) RSI 觸發門檻", min_value=15, max_value=45, value=30, step=1, help="當價格跌穿下軌，且 RSI 低於此數值時觸發買漲。")
     rsi_short_th = st.slider("⚡ 摸頭空 (買跌) RSI 觸發門檻", min_value=55, max_value=85, value=70, step=1, help="當價格突破上軌，且 RSI 高於此數值時觸發買跌。")
     st.divider()
+    # 🌟 2. 側邊欄加入正常行情建議
     st.info("""
     💡 **實戰參數調整提示：**
+    
+    ⚖️ **正常/震盪行情**：
+    建議維持預設值（買漲 $\le 30$，買跌 $\ge 70$），捕捉區間極端乖離。
     
     🐂 **狂暴牛市**：
     建議將「摸頭空」門檻調高至 80 以上，避免被強勢多頭嘎空。
@@ -39,12 +45,21 @@ with st.sidebar:
     建議將「搶反彈(買漲)」門檻調低至 20 以下，避免在無量暴跌時接刀破底。
     """)
 
-def play_alert_sound(signal_mode="trend"):
-    """根據戰術模式播放不同的提示音"""
+def play_alert_sound(signal_mode="trend", sec_left=60):
+    """播放提示音，支援主戰場與雷達的獨立音效"""
+    # 🌟 4. 最後 5 秒鐘強制靜音 (排除雷達，雷達隨時可響)
+    if sec_left <= 5 and signal_mode != "radar_rebound":
+        return
+
     t = pd.Timestamp.now().timestamp()
     if signal_mode == "rebound":
+        # 主戰場搶反彈：警報喇叭聲
         audio_url = f"https://actions.google.com/sounds/v1/alarms/bugle_tune.ogg?v={t}"
+    elif signal_mode == "radar_rebound":
+        # 🌟 5. 雷達專屬反彈音效：連續電子手錶警報聲 (明顯區隔)
+        audio_url = f"https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg?v={t}"
     else:
+        # 主戰場順勢：清脆短嗶聲
         audio_url = f"https://actions.google.com/sounds/v1/alarms/beep_short.ogg?v={t}"
         
     audio_html = f"""
@@ -98,7 +113,7 @@ def add_technical_indicators(df):
 
 def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th, rsi_short_th):
     if df_1m.empty or df_5m.empty or df_15m.empty:
-        return 0, "無資料", "info", 0.0, 0.0, "trend"
+        return 0, "無資料", "info", 0.0, 0.0, "trend", 60
 
     latest_1m = df_1m.iloc[-1]
     latest_5m = df_5m.iloc[-1]
@@ -128,26 +143,26 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
         if current_price <= bb_lower and rsi_1m <= rsi_long_th:
             score = min(85.0 + (rsi_long_th - rsi_1m), 99.0)
             desc = f"⚡ 【極端反彈】 買漲 (UP) ｜ 貫穿下軌 ＋ RSI極度恐慌 ({rsi_1m:.1f})"
-            return score, desc, "success", moat_ratio, base_price, "rebound"
+            return score, desc, "success", moat_ratio, base_price, "rebound", sec_left
             
         if current_price >= bb_upper and rsi_1m >= rsi_short_th:
             score = min(85.0 + (rsi_1m - rsi_short_th), 99.0)
             desc = f"⚡ 【極端回落】 買跌 (DOWN) ｜ 貫穿上軌 ＋ RSI極度貪婪 ({rsi_1m:.1f})"
-            return score, desc, "error", moat_ratio, base_price, "rebound"
+            return score, desc, "error", moat_ratio, base_price, "rebound", sec_left
 
     if in_dead_zone:
         if trend_up and rsi_1m > 55:
             score = 62.0
             desc = f"📈 【倒數 {countdown}】 蓄勢買漲 (UP) ｜ 糾纏區待突破 ({moat_ratio:.2f}x ATR)"
-            return score, desc, "warning", moat_ratio, base_price, "trend"
+            return score, desc, "warning", moat_ratio, base_price, "trend", sec_left
         elif not trend_up and rsi_1m < 45:
             score = 62.0
             desc = f"📉 【倒數 {countdown}】 蓄勢買跌 (DOWN) ｜ 糾纏區待跌破 ({moat_ratio:.2f}x ATR)"
-            return score, desc, "warning", moat_ratio, base_price, "trend"
+            return score, desc, "warning", moat_ratio, base_price, "trend", sec_left
         else:
             score = 45.0
             desc = f"⚖️ 【倒數 {countdown}】 無方向震盪 ｜ 死亡糾纏區，指標混亂強制觀望"
-            return score, desc, "info", moat_ratio, base_price, "trend"
+            return score, desc, "info", moat_ratio, base_price, "trend", sec_left
 
     score = 50.0 
     direction = "UP" if price_diff >= 0 else "DOWN"
@@ -190,33 +205,35 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
         action = "🔥 買漲 (UP)" if direction == "UP" else "🔥 買跌 (DOWN)"
         desc = f"【倒數 {countdown}】 訊號：{action} ｜ 護城河倍數: {moat_ratio:.2f}x ATR"
     elif score >= 65:
-        # 🌟 修正點：依照護城河的實際厚度，給予不同的黃燈警告文字
         status_type = "warning"
         action = "買漲 (UP)" if direction == "UP" else "買跌 (DOWN)"
         if moat_ratio >= 1.0:
-            desc = f"⚠️ 【倒數 {countdown}】 訊號：{action} 順勢觀察 ｜ 護城河安全 ({moat_ratio:.2f}x ATR)，但動能中性待發酵"
+            desc = f"⚠️ 【倒數 {countdown}】 訊號：{action} 順勢觀察 ｜ 護城河安全 ({moat_ratio:.2f}x ATR)，但動能待發酵"
         else:
             desc = f"⚠️ 【倒數 {countdown}】 訊號：{action} 順勢觀察 ｜ 護城河薄弱 ({moat_ratio:.2f}x ATR)"
     else:
         status_type = "info"
         desc = f"⏳ 【倒數 {countdown}】 震盪觀望 ｜ 距水面過近或指標背離"
 
-    return score, desc, status_type, moat_ratio, base_price, "trend"
+    return score, desc, status_type, moat_ratio, base_price, "trend", sec_left
 
 def generate_radar_signal(df_1m, df_5m, df_15m, symbol_name, enable_rebound, rsi_long_th, rsi_short_th):
-    score, _, _, _, _, signal_mode = calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th, rsi_short_th)
+    score, _, _, _, _, signal_mode, _ = calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th, rsi_short_th)
+    is_rebound_alert = False
+    
     if score >= 80:
         latest_1m = df_1m.iloc[-1]
         latest_5m = df_5m.iloc[-1]
         if signal_mode == "rebound":
             action = "💥 反彈UP" if latest_1m['Close'] <= latest_1m['BB_Lower'] else "💥 回落DOWN"
-            return f"**[{symbol_name}] {action} ({score:.0f}%)**"
+            is_rebound_alert = True
+            return f"**[{symbol_name}] {action} ({score:.0f}%)**", is_rebound_alert
         else:
             action = "🟢 漲" if latest_1m['Close'] >= latest_5m['Open'] else "🔴 跌"
-            return f"**[{symbol_name}] {action} ({score:.0f}%)**"
+            return f"**[{symbol_name}] {action} ({score:.0f}%)**", is_rebound_alert
     elif score >= 65:
-        return f"[{symbol_name}] 🟡 關注 ({score:.0f}%)"
-    return f"[{symbol_name}] ⚪ 觀望"
+        return f"[{symbol_name}] 🟡 關注 ({score:.0f}%)", is_rebound_alert
+    return f"[{symbol_name}] ⚪ 觀望", is_rebound_alert
 
 def plot_advanced_candlestick(df, title, baseline_price=None):
     latest_date = df['Open time'].iloc[-1].strftime('%Y-%m-%d')
@@ -232,18 +249,17 @@ def plot_advanced_candlestick(df, title, baseline_price=None):
     fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Upper'], line=dict(color='rgba(33, 150, 243, 0.6)', width=1.5, dash='dot'), name='布林上軌'))
     fig.add_trace(go.Scatter(x=df['Open time'], y=df['BB_Lower'], line=dict(color='rgba(33, 150, 243, 0.6)', width=1.5, dash='dot'), name='布林下軌'))
     
+    # 🌟 3. 取消圖表上的浮動文字，僅保留虛線
     if baseline_price is not None:
         fig.add_hline(
-            y=baseline_price, line_dash="dash", line_color="#FFFFFF", line_width=2, opacity=0.9,
-            annotation_text=f"🎯 基準水面", annotation_position="bottom right",
-            annotation_font_color="white", annotation_font_size=13
+            y=baseline_price, line_dash="dash", line_color="#FFFFFF", line_width=2, opacity=0.8
         )
     
     fig.update_layout(
         title=dict(text=f"{title} | RSI: {latest_rsi:.1f}", font=dict(size=16)),
-        xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=40, b=60),
+        xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=40, b=30),
         height=420, template="plotly_dark", uirevision="constant",
-        legend=dict(orientation="h", yanchor="top", y=-0.2, xanchor="center", x=0.5)
+        legend=dict(orientation="h", yanchor="top", y=-0.1, xanchor="center", x=0.5)
     )
     fig.update_xaxes(tickangle=-45, nticks=8, tickformat="%H:%M") 
     fig.update_xaxes(range=[df['Open time'].iloc[-80], df['Open time'].iloc[-1]])
@@ -284,14 +300,22 @@ with col_price:
 @st.fragment(run_every=10)
 def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag, r_long, r_short):
     other_symbols = [s for s in all_symbols if s != selected_symbol]
-    def fetch_radar(osym):
+    
+    def fetch_radar_data(osym):
         d1 = add_technical_indicators(get_binance_klines(osym, "1m", limit=80))
         d5 = add_technical_indicators(get_binance_klines(osym, "5m", limit=80))
         d15 = add_technical_indicators(get_binance_klines(osym, "15m", limit=80))
         return generate_radar_signal(d1, d5, d15, osym.replace("USDT", ""), enable_rebound_flag, r_long, r_short)
 
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        radar_messages = list(executor.map(fetch_radar, other_symbols))
+        radar_results = list(executor.map(fetch_radar_data, other_symbols))
+    
+    radar_messages = [res[0] for res in radar_results]
+    is_radar_rebound_triggered = any(res[1] for res in radar_results)
+    
+    # 🌟 5. 如果雷達掃描到反彈，立刻播放專屬的電子警報聲
+    if is_radar_rebound_triggered:
+        play_alert_sound("radar_rebound")
     
     st.markdown(f"<div style='text-align: left; font-size: 16px; margin-top: 10px; margin-bottom: 2px; color: #CCCCCC;'>📡 <b>背景靜音雷達：</b> {' ｜ '.join(radar_messages)}</div>", unsafe_allow_html=True)
     
@@ -299,7 +323,7 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
     df_5m = add_technical_indicators(get_binance_klines(selected_symbol, "5m"))
     df_15m = add_technical_indicators(get_binance_klines(selected_symbol, "15m"))
     
-    score, desc_text, status_type, moat_ratio, base_price, signal_mode = calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound_flag, r_long, r_short)
+    score, desc_text, status_type, moat_ratio, base_price, signal_mode, sec_left = calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound_flag, r_long, r_short)
     
     score_color = "#4FC3F7" if score >= 80 else ("#FFD54F" if score >= 65 else "#9E9E9E")
     
@@ -307,10 +331,10 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
     
     if status_type == "success":
         st.success(desc_text)
-        if score >= 80: play_alert_sound(signal_mode)
+        if score >= 80: play_alert_sound(signal_mode, sec_left)
     elif status_type == "error":
         st.error(desc_text)
-        if score >= 80: play_alert_sound(signal_mode)
+        if score >= 80: play_alert_sound(signal_mode, sec_left)
     elif status_type == "warning":
         st.warning(desc_text)
     else:
@@ -324,6 +348,9 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
         if not df_5m.empty: st.plotly_chart(plot_advanced_candlestick(df_5m, "5 分鐘線 (預測結算目標區)", baseline_price=base_price), use_container_width=True, config=chart_config, key="c5")
     with col3:
         if not df_15m.empty: st.plotly_chart(plot_advanced_candlestick(df_15m, "15 分鐘線 (確認主力大趨勢)"), use_container_width=True, config=chart_config, key="c15")
+        
+    # 🌟 3. 把基準水面的說明移到線圖正下方
+    st.markdown("<div style='text-align: center; color: #AAAAAA; font-size: 14px; margin-top: -10px;'>🎯 <b>圖表說明：</b> 圖中的水平白色虛線為本 5 分鐘區間之「開盤基準水面」。</div>", unsafe_allow_html=True)
 
 show_prediction_dashboard(symbol, available_symbols, enable_rebound, rsi_long_th, rsi_short_th)
 
@@ -337,7 +364,7 @@ with st.expander("📖 系統戰術與量化判斷邏輯 (點擊展開)"):
     
     ### ⏳ 動態時間防禦機制 (布林邊界)
     *   **前 4 分鐘佈局期：** 觸碰布林邊界時，僅在 RSI 過熱 (>75 或 <25) 時扣 12 分，容許良性突破。
-    *   **最後 60 秒保衛戰：** 零容錯率，只要觸碰布林邊界，無視 RSI 無條件扣 12 分。
+    *   **最後 60 秒保衛戰：** 零容錯率，只要觸碰布林邊界，無視 RSI 無條件扣 12 分。（註：最後 5 秒自動關閉聲音提醒，避免干擾下單）
 
     ### 🛡️ 戰術 C：死亡糾纏區 (邊界僵局處理)
     *   **觸發條件：** 當前價差小於 0.2 倍 ATR (極度貼近基準線)。
@@ -346,10 +373,10 @@ with st.expander("📖 系統戰術與量化判斷邏輯 (點擊展開)"):
 
     ### ⚡ 戰術 B：極端搶反彈 (獨立高分通道)
     *   **觸發條件：** 價格貫穿布林上下軌 ＋ RSI 超越側邊欄設定門檻。
-    *   **給分邏輯：** 無視護城河深度，觸發基礎即給予 85 分，情緒越極端分數越高 (最高 99%)。
+    *   **給分邏輯：** 無視護城河深度，觸發基礎即給予 85 分，情緒越極端分數越高 (最高 99%)。背景雷達會同步掃描，若其他幣種觸發反彈將發出專屬電子警報聲。
 
     ### 🎯 燈號對照表
-    *   🟢 **80% ~ 100% (高勝率)：** 觸發音效，建議進場主力倉位。
+    *   🟢 **80% ~ 100% (高勝率)：** 觸發音效（排除最後 5 秒），建議進場主力倉位。
     *   🟡 **65% ~ 79% (順勢觀察)：** 不觸發音效，留意護城河是否足夠或動能是否發酵。建議輕倉跟隨或觀望。
     *   ⚪ **低於 65% (震盪觀望)：** 強制觀望，嚴禁下單。
     """)
