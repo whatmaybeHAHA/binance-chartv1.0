@@ -33,35 +33,44 @@ with st.sidebar:
     
     st.header("📊 直覺化實戰期望值收集器")
     st.markdown("快速紀錄當下狀態與 5U 真實獲利")
-    payout_5u = st.number_input("💰 若下單 5U，顯示可拿回多少？", min_value=0.0, value=0.0, step=0.01)
-    if st.button("📝 寫入實戰數據"):
-        if 'ev_data' in st.session_state:
-            d = st.session_state['ev_data']
-            now = datetime.now()
-            weekdays = ["一", "二", "三", "四", "五", "六", "日"]
-            day_str = weekdays[now.weekday()]
-            time_str = now.strftime(f"%Y-%m-%d ({day_str}) %H:%M:%S")
-            
-            new_row = pd.DataFrame([{
-                "紀錄時間": time_str,
-                "交易對": d['symbol'],
-                "倒數秒數": d['sec_left'],
-                "護城河倍數": round(d['moat_ratio'], 2),
-                "1分RSI": round(d['rsi'], 2),
-                "戰術模式": d['signal_mode'],
-                "AI評分": round(d['score'], 2),
-                "5U拿回金額": payout_5u
-            }])
-            
-            file_path = "binance_ev_records.csv"
-            if not os.path.exists(file_path):
-                new_row.to_csv(file_path, index=False, encoding='utf-8-sig')
-            else:
-                new_row.to_csv(file_path, mode='a', header=False, index=False, encoding='utf-8-sig')
-            st.success(f"✅ 已紀錄：{d['symbol']} | 剩餘 {d['sec_left']}s | 護城河 {d['moat_ratio']:.1f}x | 拿回 {payout_5u}U")
-        else:
-            st.warning("⚠️ 系統尚未抓取到最新報價，請等候圖表載入。")
-            
+    
+    # 將原先的 number_input 與 button 包裝在 form 裡面，並將預設值改為 text_input 處理空白
+    with st.form(key='ev_form', clear_on_submit=True):
+        payout_input = st.text_input("💰 若下單 5U，顯示可拿回多少？ (輸入後按 Enter)", value="")
+        submit_button = st.form_submit_button("📝 寫入實戰數據 (隱藏按鈕可不點)", use_container_width=True)
+        
+        if submit_button and payout_input.strip() != "":
+            try:
+                payout_val = float(payout_input)
+                if 'ev_data' in st.session_state:
+                    d = st.session_state['ev_data']
+                    now = datetime.now()
+                    weekdays = ["一", "二", "三", "四", "五", "六", "日"]
+                    day_str = weekdays[now.weekday()]
+                    time_str = now.strftime(f"%Y-%m-%d ({day_str}) %H:%M:%S")
+                    
+                    new_row = pd.DataFrame([{
+                        "紀錄時間": time_str,
+                        "交易對": d['symbol'],
+                        "倒數秒數": d['sec_left'],
+                        "護城河倍數": round(d['moat_ratio'], 2),
+                        "1分RSI": round(d['rsi'], 2),
+                        "戰術模式": d['signal_mode'],
+                        "AI評分": round(d['score'], 2),
+                        "5U拿回金額": payout_val
+                    }])
+                    
+                    file_path = "binance_ev_records.csv"
+                    if not os.path.exists(file_path):
+                        new_row.to_csv(file_path, index=False, encoding='utf-8-sig')
+                    else:
+                        new_row.to_csv(file_path, mode='a', header=False, index=False, encoding='utf-8-sig')
+                    st.success(f"✅ 已紀錄：{d['symbol']} | 剩餘 {d['sec_left']}s | 護城河 {d['moat_ratio']:.1f}x | 拿回 {payout_val}U")
+                else:
+                    st.warning("⚠️ 系統尚未抓取到最新報價，請等候圖表載入。")
+            except ValueError:
+                st.error("⚠️ 請輸入有效的數字 (例如: 7.25)")
+                
     st.divider()
     st.info("💡 **實戰參數調整提示：**\n\n🐂 **狂暴牛市**：摸頭空門檻調高至 80 以上。\n\n🐻 **絕望熊市**：搶反彈門檻調低至 20 以下。")
 
