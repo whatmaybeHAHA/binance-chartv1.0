@@ -4,10 +4,11 @@ import numpy as np
 import requests
 import plotly.graph_objects as go
 import concurrent.futures
+import os
+from datetime import datetime
 
 st.set_page_config(layout="wide", page_title="幣安 5 分鐘預測高勝率看盤系統 - 終極戰術版")
 
-# 🌟 強制放大 Checkbox 容器與改變字體顏色
 st.markdown('''
 <style>
 div[data-testid="stCheckbox"] {
@@ -24,44 +25,57 @@ div[data-testid="stCheckbox"] label p {
 </style>
 ''', unsafe_allow_html=True)
 
-# --- 側邊欄：戰術參數微調 ---
 with st.sidebar:
     st.header("⚙️ 戰術參數微調")
-    st.markdown("針對不同的市場波動情緒，你可以隨時微調極端反彈的觸發門檻：")
-    rsi_long_th = st.slider("⚡ 搶反彈 (買漲) RSI 觸發門檻", min_value=15, max_value=45, value=30, step=1, help="當價格跌穿下軌，且 RSI 低於此數值時觸發買漲。")
-    rsi_short_th = st.slider("⚡ 摸頭空 (買跌) RSI 觸發門檻", min_value=55, max_value=85, value=70, step=1, help="當價格突破上軌，且 RSI 高於此數值時觸發買跌。")
+    rsi_long_th = st.slider("⚡ 搶反彈 (買漲) RSI 觸發門檻", min_value=15, max_value=45, value=30, step=1)
+    rsi_short_th = st.slider("⚡ 摸頭空 (買跌) RSI 觸發門檻", min_value=55, max_value=85, value=70, step=1)
     st.divider()
-    st.info('''
-    💡 **實戰參數調整提示：**
     
-    ⚖️ **正常/震盪行情**：
-    建議維持預設值（買漲 <= 30，買跌 >= 70），捕捉區間極端乖離。
-    
-    🐂 **狂暴牛市**：
-    建議將「摸頭空」門檻調高至 80 以上，避免被強勢多頭嘎空。
-    
-    🐻 **絕望熊市**：
-    建議將「搶反彈(買漲)」門檻調低至 20 以下，避免在無量暴跌時接刀破底。
-    ''')
+    st.header("📊 直覺化實戰期望值收集器")
+    st.markdown("快速紀錄當下狀態與 5U 真實獲利")
+    payout_5u = st.number_input("💰 若下單 5U，顯示可拿回多少？", min_value=0.0, value=0.0, step=0.01)
+    if st.button("📝 寫入實戰數據"):
+        if 'ev_data' in st.session_state:
+            d = st.session_state['ev_data']
+            now = datetime.now()
+            weekdays = ["一", "二", "三", "四", "五", "六", "日"]
+            day_str = weekdays[now.weekday()]
+            time_str = now.strftime(f"%Y-%m-%d ({day_str}) %H:%M:%S")
+            
+            new_row = pd.DataFrame([{
+                "紀錄時間": time_str,
+                "交易對": d['symbol'],
+                "倒數秒數": d['sec_left'],
+                "護城河倍數": round(d['moat_ratio'], 2),
+                "1分RSI": round(d['rsi'], 2),
+                "戰術模式": d['signal_mode'],
+                "AI評分": round(d['score'], 2),
+                "5U拿回金額": payout_5u
+            }])
+            
+            file_path = "binance_ev_records.csv"
+            if not os.path.exists(file_path):
+                new_row.to_csv(file_path, index=False, encoding='utf-8-sig')
+            else:
+                new_row.to_csv(file_path, mode='a', header=False, index=False, encoding='utf-8-sig')
+            st.success(f"✅ 已紀錄：{d['symbol']} | 剩餘 {d['sec_left']}s | 護城河 {d['moat_ratio']:.1f}x | 拿回 {payout_5u}U")
+        else:
+            st.warning("⚠️ 系統尚未抓取到最新報價，請等候圖表載入。")
+            
+    st.divider()
+    st.info("💡 **實戰參數調整提示：**\n\n🐂 **狂暴牛市**：摸頭空門檻調高至 80 以上。\n\n🐻 **絕望熊市**：搶反彈門檻調低至 20 以下。")
 
 def play_alert_sound(signal_mode="trend", sec_left=60):
-    """播放提示音，支援主戰場與雷達的獨立音效"""
-    # 🌟 修改 4：最後 15 秒鐘強制靜音 (排除雷達，雷達隨時可響)
     if sec_left <= 15 and signal_mode not in ["radar_rebound", "radar_trend"]:
         return
-
     t = pd.Timestamp.now().timestamp()
     if signal_mode == "rebound":
-        # 主戰場搶反彈：警報喇叭聲
         audio_url = f"https://actions.google.com/sounds/v1/alarms/bugle_tune.ogg?v={t}"
     elif signal_mode == "radar_rebound":
-        # 雷達專屬反彈音效：連續電子手錶警報聲
         audio_url = f"https://actions.google.com/sounds/v1/alarms/digital_watch_alarm_long.ogg?v={t}"
     elif signal_mode == "radar_trend":
-        # 🌟 修改 2：雷達順勢音效為微弱滴答聲
         audio_url = f"https://actions.google.com/sounds/v1/alarms/mechanical_clock_tick.ogg?v={t}"
     else:
-        # 主戰場順勢：清脆短嗶聲
         audio_url = f"https://actions.google.com/sounds/v1/alarms/beep_short.ogg?v={t}"
         
     audio_html = f'''
@@ -72,7 +86,7 @@ def play_alert_sound(signal_mode="trend", sec_left=60):
     st.markdown(audio_html, unsafe_allow_html=True)
 
 @st.cache_data(ttl=5)
-def get_binance_klines(symbol, interval, limit=40): # 🌟 修改 5：精簡至 40 根 K 線
+def get_binance_klines(symbol, interval, limit=40):
     url = "https://data-api.binance.vision/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     try:
@@ -115,7 +129,7 @@ def add_technical_indicators(df):
 
 def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th, rsi_short_th):
     if df_1m.empty or df_5m.empty or df_15m.empty:
-        return 0, "無資料", "info", 0.0, 0.0, "trend", 60
+        return 0, "無資料", "info", 0.0, 0.0, "trend", 60, 50.0
 
     latest_1m = df_1m.iloc[-1]
     latest_5m = df_5m.iloc[-1]
@@ -145,26 +159,26 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
         if current_price <= bb_lower and rsi_1m <= rsi_long_th:
             score = min(85.0 + (rsi_long_th - rsi_1m), 99.0)
             desc = f"⚡ 【極端反彈】 買漲 (UP) ｜ 貫穿下軌 ＋ RSI極度恐慌 ({rsi_1m:.1f})"
-            return score, desc, "success", moat_ratio, base_price, "rebound", sec_left
+            return score, desc, "success", moat_ratio, base_price, "rebound", sec_left, rsi_1m
             
         if current_price >= bb_upper and rsi_1m >= rsi_short_th:
             score = min(85.0 + (rsi_1m - rsi_short_th), 99.0)
             desc = f"⚡ 【極端回落】 買跌 (DOWN) ｜ 貫穿上軌 ＋ RSI極度貪婪 ({rsi_1m:.1f})"
-            return score, desc, "error", moat_ratio, base_price, "rebound", sec_left
+            return score, desc, "error", moat_ratio, base_price, "rebound", sec_left, rsi_1m
 
     if in_dead_zone:
         if trend_up and rsi_1m > 55:
             score = 62.0
             desc = f"📈 【倒數 {countdown}】 蓄勢買漲 (UP) ｜ 糾纏區待突破 ({moat_ratio:.2f}x ATR)"
-            return score, desc, "warning", moat_ratio, base_price, "trend", sec_left
+            return score, desc, "warning", moat_ratio, base_price, "trend", sec_left, rsi_1m
         elif not trend_up and rsi_1m < 45:
             score = 62.0
             desc = f"📉 【倒數 {countdown}】 蓄勢買跌 (DOWN) ｜ 糾纏區待跌破 ({moat_ratio:.2f}x ATR)"
-            return score, desc, "warning", moat_ratio, base_price, "trend", sec_left
+            return score, desc, "warning", moat_ratio, base_price, "trend", sec_left, rsi_1m
         else:
             score = 45.0
             desc = f"⚖️ 【倒數 {countdown}】 無方向震盪 ｜ 死亡糾纏區，指標混亂強制觀望"
-            return score, desc, "info", moat_ratio, base_price, "trend", sec_left
+            return score, desc, "info", moat_ratio, base_price, "trend", sec_left, rsi_1m
 
     score = 50.0 
     direction = "UP" if price_diff >= 0 else "DOWN"
@@ -217,10 +231,10 @@ def calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th
         status_type = "info"
         desc = f"⏳ 【倒數 {countdown}】 震盪觀望 ｜ 距水面過近或指標背離"
 
-    return score, desc, status_type, moat_ratio, base_price, "trend", sec_left
+    return score, desc, status_type, moat_ratio, base_price, "trend", sec_left, rsi_1m
 
 def generate_radar_signal(df_1m, df_5m, df_15m, symbol_name, enable_rebound, rsi_long_th, rsi_short_th):
-    score, _, _, _, _, signal_mode, _ = calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th, rsi_short_th)
+    score, _, _, _, _, signal_mode, _, _ = calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound, rsi_long_th, rsi_short_th)
     
     if score >= 80:
         latest_1m = df_1m.iloc[-1]
@@ -271,7 +285,6 @@ available_symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT"]
 
 col_setting, col_price, col_toggle = st.columns([1.5, 1.5, 2])
 with col_setting:
-    # 🌟 修改 1：將下拉選單改為橫向 radio 點擊按鈕
     symbol = st.radio("選擇主戰場 (發出音效)", available_symbols, horizontal=True)
 with col_toggle:
     st.write("") 
@@ -297,12 +310,12 @@ def show_realtime_price(selected_symbol):
 with col_price:
     show_realtime_price(symbol)
 
-@st.fragment(run_every=10) # 🌟 仍維持每 10 秒更新
+@st.fragment(run_every=10)
 def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag, r_long, r_short):
     other_symbols = [s for s in all_symbols if s != selected_symbol]
     
     def fetch_radar_data(osym):
-        d1 = add_technical_indicators(get_binance_klines(osym, "1m", limit=40)) # 🌟 修改 5：40根
+        d1 = add_technical_indicators(get_binance_klines(osym, "1m", limit=40))
         d5 = add_technical_indicators(get_binance_klines(osym, "5m", limit=40))
         d15 = add_technical_indicators(get_binance_klines(osym, "15m", limit=40))
         clean_name = osym.replace("USDT", "") 
@@ -313,7 +326,6 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
     
     radar_messages = [res[0] for res in radar_results]
     
-    # 🌟 判斷雷達音效 (反彈優先於順勢)
     radar_signal_to_play = None
     for res in radar_results:
         if res[1] == "radar_rebound":
@@ -324,7 +336,7 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
                 radar_signal_to_play = "radar_trend"
     
     if radar_signal_to_play:
-        play_alert_sound(radar_signal_to_play) # 不傳 sec_left，雷達永遠能響
+        play_alert_sound(radar_signal_to_play)
     
     st.markdown(f"<div style='text-align: left; font-size: 16px; margin-top: 10px; margin-bottom: 2px; color: #CCCCCC;'>📡 <b>背景雷達：</b> {' ｜ '.join(radar_messages)}</div>", unsafe_allow_html=True)
     
@@ -332,7 +344,17 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
     df_5m = add_technical_indicators(get_binance_klines(selected_symbol, "5m", limit=40))
     df_15m = add_technical_indicators(get_binance_klines(selected_symbol, "15m", limit=40))
     
-    score, desc_text, status_type, moat_ratio, base_price, signal_mode, sec_left = calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound_flag, r_long, r_short)
+    score, desc_text, status_type, moat_ratio, base_price, signal_mode, sec_left, rsi_1m = calculate_confidence_score(df_1m, df_5m, df_15m, enable_rebound_flag, r_long, r_short)
+    
+    # 將資料寫入 session_state，供側邊欄收集器呼叫
+    st.session_state['ev_data'] = {
+        'symbol': selected_symbol,
+        'score': score,
+        'moat_ratio': moat_ratio,
+        'rsi': rsi_1m,
+        'sec_left': sec_left,
+        'signal_mode': signal_mode
+    }
     
     score_color = "#4FC3F7" if score >= 80 else ("#FFD54F" if score >= 65 else "#9E9E9E")
     
@@ -358,12 +380,10 @@ def show_prediction_dashboard(selected_symbol, all_symbols, enable_rebound_flag,
     with col3:
         if not df_15m.empty: st.plotly_chart(plot_advanced_candlestick(df_15m, "15 分鐘線 (確認主力大趨勢)"), use_container_width=True, config=chart_config, key="c15")
         
-    # 🌟 修改 3：只保留唯一一行圖表說明
     st.markdown("<div style='text-align: center; color: #AAAAAA; font-size: 14px; margin-top: -10px;'>🎯 <b>圖表說明：</b> 圖中的水平白色虛線為本 5 分鐘區間之「開盤基準水面」。</div>", unsafe_allow_html=True)
 
 show_prediction_dashboard(symbol, available_symbols, enable_rebound, rsi_long_th, rsi_short_th)
 
-# --- 網頁底部：系統說明書 ---
 st.divider()
 with st.expander("📖 系統戰術與量化判斷邏輯 (點擊展開)"):
     st.markdown('''
