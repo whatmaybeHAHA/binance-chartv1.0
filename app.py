@@ -34,10 +34,13 @@ with st.sidebar:
     st.header("📊 直覺化實戰期望值收集器")
     st.markdown("快速紀錄當下狀態與 5U 真實獲利")
     
-    # 將原先的 number_input 與 button 包裝在 form 裡面，並將預設值改為 text_input 處理空白
+    # 在 Session State 中建立一個歷史紀錄表
+    if 'record_history' not in st.session_state:
+        st.session_state.record_history = pd.DataFrame()
+    
     with st.form(key='ev_form', clear_on_submit=True):
         payout_input = st.text_input("💰 若下單 5U，顯示可拿回多少？ (輸入後按 Enter)", value="")
-        submit_button = st.form_submit_button("📝 寫入實戰數據 (隱藏按鈕可不點)", use_container_width=True)
+        submit_button = st.form_submit_button("📝 寫入實戰數據", use_container_width=True)
         
         if submit_button and payout_input.strip() != "":
             try:
@@ -47,32 +50,42 @@ with st.sidebar:
                     now = datetime.now()
                     weekdays = ["一", "二", "三", "四", "五", "六", "日"]
                     day_str = weekdays[now.weekday()]
-                    time_str = now.strftime(f"%Y-%m-%d ({day_str}) %H:%M:%S")
+                    time_str = now.strftime(f"%m-%d ({day_str}) %H:%M:%S") # 縮短時間顯示以節省空間
                     
                     new_row = pd.DataFrame([{
-                        "紀錄時間": time_str,
-                        "交易對": d['symbol'],
-                        "倒數秒數": d['sec_left'],
-                        "護城河倍數": round(d['moat_ratio'], 2),
-                        "1分RSI": round(d['rsi'], 2),
-                        "戰術模式": d['signal_mode'],
-                        "AI評分": round(d['score'], 2),
-                        "5U拿回金額": payout_val
+                        "時間": time_str,
+                        "倒數": f"{d['sec_left']}s",
+                        "護城河": f"{d['moat_ratio']:.1f}x",
+                        "RSI": round(d['rsi'], 1),
+                        "模式": "反彈" if d['signal_mode'] == "rebound" else "順勢",
+                        "拿回": payout_val
                     }])
                     
-                    file_path = "binance_ev_records.csv"
-                    if not os.path.exists(file_path):
-                        new_row.to_csv(file_path, index=False, encoding='utf-8-sig')
-                    else:
-                        new_row.to_csv(file_path, mode='a', header=False, index=False, encoding='utf-8-sig')
-                    st.success(f"✅ 已紀錄：{d['symbol']} | 剩餘 {d['sec_left']}s | 護城河 {d['moat_ratio']:.1f}x | 拿回 {payout_val}U")
+                    # 將新紀錄加入到歷史紀錄表中
+                    st.session_state.record_history = pd.concat([new_row, st.session_state.record_history], ignore_index=True)
+                    st.success(f"✅ 已紀錄：拿回 {payout_val}U")
                 else:
-                    st.warning("⚠️ 系統尚未抓取到最新報價，請等候圖表載入。")
+                    st.warning("⚠️ 系統尚未抓取到最新報價。")
             except ValueError:
                 st.error("⚠️ 請輸入有效的數字 (例如: 7.25)")
+    
+    # 直接在側邊欄顯示歷史紀錄表與下載按鈕
+    if not st.session_state.record_history.empty:
+        st.markdown("### 📋 你的實戰紀錄 (今日)")
+        st.dataframe(st.session_state.record_history, hide_index=True, use_container_width=True)
+        
+        # 產生 CSV 下載檔案
+        csv_data = st.session_state.record_history.to_csv(index=False, encoding='utf-8-sig')
+        st.download_button(
+            label="📥 點此下載 CSV 檔案",
+            data=csv_data,
+            file_name=f"binance_ev_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
                 
     st.divider()
-    st.info("💡 **實戰參數調整提示：**\n\n🐂 **狂暴牛市**：摸頭空門檻調高至 80 以上。\n\n🐻 **絕望熊市**：搶反彈門檻調低至 20 以下。")
+    st.info("💡 **實戰提示：**\n\n🐂 **狂暴牛市**：摸頭空門檻調高至 80 以上。\n\n🐻 **絕望熊市**：搶反彈門檻調低至 20 以下。")
 
 def play_alert_sound(signal_mode="trend", sec_left=60):
     if sec_left <= 15 and signal_mode not in ["radar_rebound", "radar_trend"]:
