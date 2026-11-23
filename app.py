@@ -1,4 +1,5 @@
 import math
+import re
 import concurrent.futures
 from datetime import datetime, timezone, timedelta
 
@@ -46,6 +47,10 @@ if "selected_symbol" not in st.session_state or st.session_state.selected_symbol
     st.session_state.selected_symbol = "BTCUSDT"
 if "latest_context" not in st.session_state:
     st.session_state.latest_context = None
+if "frozen_snapshot" not in st.session_state:
+    st.session_state.frozen_snapshot = None
+if "last_submit_feedback" not in st.session_state:
+    st.session_state.last_submit_feedback = None
 if "local_records" not in st.session_state:
     st.session_state.local_records = []
 
@@ -66,6 +71,12 @@ div[data-testid="stCheckbox"] label div[role="checkbox"] {
     font-size: 21px !important;
     font-weight: bold !important;
     border-radius: 10px !important;
+}
+.freeze-btn-wrap button {
+    height: 46px !important;
+    font-size: 16px !important;
+    font-weight: bold !important;
+    border-radius: 8px !important;
 }
 </style>
 """, unsafe_allow_html=True)
@@ -103,7 +114,7 @@ def get_taiwan_time_info():
 @st.cache_resource
 def get_http_session():
     session = requests.Session()
-    session.headers.update({"User-Agent": "BinancePredictV31/3.1"})
+    session.headers.update({"User-Agent": "BinancePredictV31/3.1.1"})
     return session
 
 
@@ -146,6 +157,60 @@ def play_alert_sound(sound_type="main_trend"):
         f'<audio autoplay style="display:none;"><source src="{url}" type="audio/ogg"></audio>',
         unsafe_allow_html=True,
     )
+
+
+def parse_quote_inputs(up_raw, dn_raw):
+    """
+    解析報價輸入，支援：
+    1) 第一格「單格雙邊快填」：以空白、全形空白、逗號或斜線分隔（例：'6.14 23.33' -> UP=6.14, DOWN=23.33；'- 23.33' -> 僅 DOWN）
+    2) 傳統單邊或雙格分別輸入（第一格 UP、第二格 DOWN）
+    """
+    up_tokens = [t for t in re.split(r"[\s\u3000,/，]+", up_raw.strip()) if t]
+    dn_tokens = [t for t in re.split(r"[\s\u3000,/，]+", dn_raw.strip()) if t]
+
+    if not up_tokens and not dn_tokens:
+        return None, None, "請至少輸入買漲或買跌其中一側的金額。"
+
+    def _to_float_or_none(tok):
+        if tok == "-":
+            return None
+        return float(tok)
+
+    # 情況 A：第一格輸入兩個數值（雙邊快填：左 UP、右 DOWN）
+    if len(up_tokens) == 2 and len(dn_tokens) == 0:
+        try:
+            u = _to_float_or_none(up_tokens[0])
+            d = _to_float_or_none(up_tokens[1])
+            if u is None and d is None:
+                return None, None, "請輸入有效數字（例：6.14 23.33）。"
+            return u, d, None
+        except ValueError:
+            return None, None, "雙邊快填格式錯誤：請輸入兩個純數字並以空白分隔（例：6.14 23.33 或 0 490）。"
+
+    # 情況 B：第二格不小心輸入兩個數值
+    if len(up_tokens) == 0 and len(dn_tokens) == 2:
+        try:
+            u = _to_float_or_none(dn_tokens[0])
+            d = _to_float_or_none(dn_tokens[1])
+            if u is None and d is None:
+                return None, None, "請輸入有效數字（例：6.14 23.33）。"
+            return u, d, None
+        except ValueError:
+            return None, None, "雙邊快填格式錯誤：請輸入兩個純數字並以空白分隔（例：6.14 23.33）。"
+
+    # 情況 C：單格超過 2 個數字，或雙邊快填又同時填了第二格
+    if len(up_tokens) > 1 or len(dn_tokens) > 1:
+        return None, None, "格式衝突：雙邊快填請只在第一格輸入兩個數字（例：6.14 23.33），勿同時填寫第二格。"
+
+    # 情況 D：標準單格單值（可填單邊或兩格各填一邊）
+    try:
+        u = _to_float_or_none(up_tokens[0]) if up_tokens else None
+        d = _to_float_or_none(dn_tokens[0]) if dn_tokens else None
+        if u is None and d is None:
+            return None, None, "請至少輸入一個有效數字。"
+        return u, d, None
+    except ValueError:
+        return None, None, "請輸入純數字（例：6.70、0，或雙邊快填 6.14 23.33）。"
 
 
 # --- 幣安公開 API 與本地重採樣 ---
@@ -284,7 +349,7 @@ def estimate_binance_quote(price_diff, base_price, sig_park10, sec_left, side):
     return round(est_5u, 2), is_lock_zone, z_up
 
 
-# --- V3.1 核心量化評分（純數值版，儀表板與表單送出共用，徹底根治 10 秒快照延遲） ---
+# --- V3.1 核心量化評分（純數值版，儀表板、凍結按鈕與表單送出共用） ---
 def evaluate_v31_from_scalars(
     symbol, base_price, current_price, atr_1m, sig_park10,
     vol_ratio, taker_buy_ratio, rsi_1m, bb_upper, bb_lower,
@@ -382,11 +447,10 @@ def evaluate_v31_from_scalars(
         })
         return res
 
-    # 4. V3.1 順勢引擎：Parkinson-10 + 零中心化微調（消除表 3 的 +2.5% 過度樂觀誤差）
+    # 4. V3.1 順勢引擎：Parkinson-10 + 零中心化微調
     direction = "UP" if price_diff >= 0 else "DOWN"
     delta_p = 0.0
 
-    # (a) 量能反轉因子（正常量能歸零，縮量收斂至 +2.0%）
     if vol_ratio < 0.5:
         delta_p += 0.020
         vol_tag = f"🌟 縮量安靜 ({vol_ratio:.2f}x)"
@@ -396,7 +460,6 @@ def evaluate_v31_from_scalars(
         delta_p -= 0.015
         vol_tag = f"⚠️ 爆量波動風險 ({vol_ratio:.2f}x)"
 
-    # (b) 過熱與布林地雷防禦（通道內歸零，保留過熱與碰邊界重罰）
     is_rsi_hot = (direction == "UP" and rsi_1m > 75) or (direction == "DOWN" and rsi_1m < 25)
     is_rsi_cool = (direction == "UP" and rsi_1m < 40) or (direction == "DOWN" and rsi_1m > 60)
     is_bb_touch = (direction == "UP" and current_price >= bb_upper) or (direction == "DOWN" and current_price <= bb_lower)
@@ -425,7 +488,6 @@ def evaluate_v31_from_scalars(
     is_danger = len(danger_reasons) > 0
     in_time_window = (15 < sec_left <= 150)
 
-    # 分層輸出與嚴格靜音控制
     if is_danger:
         status_type = "warning"
         tactic_tag = "地雷禁買"
@@ -511,11 +573,9 @@ def evaluate_market_v31(
     atr_val = prev_1m["ATR"] if not np.isnan(prev_1m["ATR"]) and prev_1m["ATR"] > 0 else latest_1m["ATR"]
     atr_1m = float(atr_val) if not np.isnan(atr_val) and atr_val > 0 else max(current_price * 0.0005, 0.01)
 
-    # 嚴格取已收盤前一根的 Parkinson-10 波動率
     park_val = prev_1m["Sig_Park10"] if not np.isnan(prev_1m["Sig_Park10"]) and prev_1m["Sig_Park10"] > 0 else latest_1m["Sig_Park10"]
     sig_park10 = float(park_val) if not np.isnan(park_val) and park_val > 0 else (atr_1m / max(current_price, 1.0)) * 0.7
 
-    # 時間投影量能校正（換分前 12 秒沿用前一根完整 K 棒）
     vol_ma = float(prev_1m["Vol_MA20"]) if not np.isnan(prev_1m["Vol_MA20"]) and prev_1m["Vol_MA20"] > 0 else 1.0
     if sec_elapsed_1m >= 12:
         proj_vol = float(latest_1m["Volume"]) * (60.0 / sec_elapsed_1m)
@@ -538,7 +598,6 @@ def evaluate_market_v31(
         enable_rebound, rsi_long_th, rsi_short_th, only_low_vol_alert
     )
 
-    # 打包精簡背景參數，讓表單按下 Enter 當下能用最新價格與秒數即時重算
     ctx = {
         "symbol": symbol,
         "round_5m_open_str": round_str,
@@ -557,6 +616,47 @@ def evaluate_market_v31(
         "only_low_vol_alert": only_low_vol_alert,
     }
     return ev, ctx
+
+
+def capture_live_snapshot(sym_now):
+    """即時抓取當毫秒 Mid 價與剩餘秒數，完整重算並打包為快照（供凍結按鈕與即時送出共用）"""
+    now_tw, live_epoch_5m, live_sec_left, _, round_open_tw, live_is_trap, live_slot = get_taiwan_time_info()
+    live_round_str = round_open_tw.strftime("%Y-%m-%d %H:%M")
+    live_mid = get_mid_price(sym_now)
+    ctx = st.session_state.latest_context
+
+    if ctx is None or ctx.get("symbol") != sym_now or ctx.get("round_5m_open_str") != live_round_str:
+        d1_live = add_technical_indicators(fetch_1m_klines(sym_now, live_epoch_5m, limit=60))
+        d5_live = add_technical_indicators(resample_klines(d1_live, "5min"))
+        t1h_live = fetch_1h_trend(sym_now, live_epoch_5m)
+        live_ev, new_ctx = evaluate_market_v31(
+            sym_now, d1_live, d5_live, live_mid, t1h_live,
+            ctx["enable_rebound"] if ctx else True,
+            ctx["rsi_long_th"] if ctx else 30,
+            ctx["rsi_short_th"] if ctx else 70,
+            ctx["only_low_vol_alert"] if ctx else True,
+        )
+        if new_ctx is not None:
+            st.session_state.latest_context = new_ctx
+    else:
+        mid_use = live_mid if live_mid is not None else ctx["base_price"]
+        live_ev = evaluate_v31_from_scalars(
+            sym_now, ctx["base_price"], mid_use, ctx["atr_1m"], ctx["sig_park10"],
+            ctx["vol_ratio"], ctx["taker_buy_ratio"], ctx["rsi_1m"],
+            ctx["bb_upper"], ctx["bb_lower"], ctx["trend_1h"],
+            live_sec_left, live_round_str, live_is_trap, live_slot,
+            ctx["enable_rebound"], ctx["rsi_long_th"], ctx["rsi_short_th"],
+            ctx["only_low_vol_alert"],
+        )
+
+    return {
+        "now_tw": now_tw,
+        "live_round_str": live_round_str,
+        "live_sec_left": live_sec_left,
+        "live_slot": live_slot,
+        "sym_now": sym_now,
+        "live_ev": live_ev,
+    }
 
 
 def plot_advanced_candlestick(df, title, baseline_price=None):
@@ -597,7 +697,7 @@ def plot_advanced_candlestick(df, title, baseline_price=None):
     return fig
 
 
-# --- 側邊欄：Google Sheets 5U 賠率收集器 (含即時重算與防誤打防呆) + V3.1 參數 ---
+# --- 側邊欄：Google Sheets 5U 賠率收集器 (含凍結按鈕 ＋ 單格雙邊快填 ＋ 防誤打防呆) ---
 with st.sidebar:
     st.header("📝 5U 真實賠率收集器")
     ws, gs_msg = get_gsheet_worksheet()
@@ -606,140 +706,210 @@ with st.sidebar:
     else:
         st.caption(f"🟡 {gs_msg}（先暫存本頁，可下載 CSV）")
 
+    # 📸 鎖定當下瞬間 / 解除按鈕列（徹底解決看雙邊報價與打字的時間飄移）
+    f_col1, f_col2 = st.columns([2.2, 1.0])
+    with f_col1:
+        st.markdown('<div class="freeze-btn-wrap">', unsafe_allow_html=True)
+        freeze_clicked = st.button(
+            "📸 鎖定當下瞬間",
+            key="btn_freeze_moment",
+            type="primary" if st.session_state.frozen_snapshot is None else "secondary",
+            use_container_width=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+    with f_col2:
+        st.markdown('<div class="freeze-btn-wrap">', unsafe_allow_html=True)
+        unfreeze_clicked = st.button(
+            "🔓 解除",
+            key="btn_unfreeze_moment",
+            disabled=(st.session_state.frozen_snapshot is None),
+            use_container_width=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    if freeze_clicked:
+        st.session_state.frozen_snapshot = capture_live_snapshot(st.session_state.selected_symbol)
+        st.session_state.last_submit_feedback = None
+        st.rerun()
+
+    if unfreeze_clicked:
+        st.session_state.frozen_snapshot = None
+        st.session_state.last_submit_feedback = None
+        st.rerun()
+
+    # 若處於凍結狀態，顯示清晰凍結資訊卡片（並檢查是否已跨局）
+    frozen = st.session_state.frozen_snapshot
+    if frozen is not None:
+        _, _, _, _, cur_round_tw, _, _ = get_taiwan_time_info()
+        cur_round_str = cur_round_tw.strftime("%Y-%m-%d %H:%M")
+        fev = frozen["live_ev"]
+        f_sym = frozen["sym_now"].replace("USDT", "")
+        f_hms = frozen["now_tw"].strftime("%H:%M:%S")
+        is_stale_round = (frozen["live_round_str"] != cur_round_str)
+
+        stale_warn = (
+            f"\n\n⚠️ **注意：此凍結為上一局 ({frozen['live_round_str']})**，若要記本局請重新點擊鎖定或解除！"
+            if is_stale_round else ""
+        )
+        st.info(
+            f"📌 **已鎖定瞬間（寫入後自動解除）**\n\n"
+            f"**{f_sym}** ｜ `{f_hms}` (剩 **{frozen['live_sec_left']}s**)\n\n"
+            f"Mid: `{fev['mid_price']:,.2f}` ｜ 勝率: **{fev['p_est']*100:.1f}% ({fev['direction']})** ｜ 預估: `~{fev['est_binance_5u']:.2f}U`"
+            f"{stale_warn}"
+        )
+
+    # 單格雙邊快填 ＋ 雙格兼容表單
     with st.form("ev_collector_form", clear_on_submit=True):
-        st.markdown("看一眼幣安 App，填單邊或雙邊後按 **Enter** 秒存（鎖單填 `0`）：")
+        st.markdown("💡 **快填技巧**：第一格直接打 **`UP DOWN`**（空白分隔，如 `6.14 23.33`）按 **Enter** 一次存雙邊；單邊可分格填，鎖單填 `0`。")
         c_up, c_dn = st.columns(2)
         with c_up:
-            up_input = st.text_input("🟢 買漲(UP) 5U拿回", placeholder="例: 6.70")
+            up_input = st.text_input("🟢 UP｜雙邊快填", placeholder="6.70 或 6.14 23.33")
         with c_dn:
-            dn_input = st.text_input("🔴 買跌(DOWN) 5U拿回", placeholder="選填或0")
-        bypass_guard = st.checkbox("略過欄位防呆（特殊極端行情強制寫入）", value=False)
-        submitted = st.form_submit_button("💾 立即寫入紀錄 (Enter)", use_container_width=True)
+            dn_input = st.text_input("🔴 DOWN (單填)", placeholder="選填或0")
+        bypass_guard = st.checkbox("略過欄位防呆（極端行情強制寫入）", value=False)
+        submit_lbl = "💾 寫入【凍結瞬間】紀錄 (Enter)" if frozen is not None else "💾 立即寫入紀錄 (Enter)"
+        submitted = st.form_submit_button(submit_lbl, use_container_width=True)
 
     if submitted:
-        up_str = up_input.strip()
-        dn_str = dn_input.strip()
-        if not up_str and not dn_str:
-            st.warning("請至少輸入買漲或買跌其中一側的金額。")
+        up_val, dn_val, parse_err = parse_quote_inputs(up_input, dn_input)
+        if parse_err is not None:
+            st.session_state.last_submit_feedback = ("error", f"⚠️ {parse_err}")
         else:
-            try:
-                up_val = float(up_str) if up_str else None
-                dn_val = float(dn_str) if dn_str else None
+            # 防呆 1：數值硬範圍檢查（幣安 5U 封頂約 490U）
+            range_err_msg = None
+            if up_val is not None and (up_val < 0 or up_val > 500):
+                range_err_msg = f"🚫 買漲(UP) 金額 `{up_val}` 超出合理範圍 (0 ~ 500 U)，已攔截！"
+            elif dn_val is not None and (dn_val < 0 or dn_val > 500):
+                range_err_msg = f"🚫 買跌(DOWN) 金額 `{dn_val}` 超出合理範圍 (0 ~ 500 U)，已攔截！"
 
-                # 防呆 1：數值硬範圍檢查（幣安 5U 封頂約 490U，徹底擋下如 6021 等誤打）
-                range_err = False
-                if up_val is not None and (up_val < 0 or up_val > 500):
-                    st.error(f"🚫 買漲(UP) 金額 `{up_val}` 超出合理範圍 (0 ~ 500 U)，已攔截！")
-                    range_err = True
-                if dn_val is not None and (dn_val < 0 or dn_val > 500):
-                    st.error(f"🚫 買跌(DOWN) 金額 `{dn_val}` 超出合理範圍 (0 ~ 500 U)，已攔截！")
-                    range_err = True
+            if range_err_msg is not None:
+                st.session_state.last_submit_feedback = ("error", range_err_msg)
+            else:
+                # 優先使用「凍結快照」，否則即時重算當毫秒數值
+                used_freeze = (st.session_state.frozen_snapshot is not None)
+                snap_pkg = (
+                    st.session_state.frozen_snapshot
+                    if used_freeze
+                    else capture_live_snapshot(st.session_state.selected_symbol)
+                )
 
-                if not range_err:
-                    now_tw, live_epoch_5m, live_sec_left, _, round_open_tw, live_is_trap, live_slot = get_taiwan_time_info()
-                    live_round_str = round_open_tw.strftime("%Y-%m-%d %H:%M")
-                    sym_now = st.session_state.selected_symbol
-                    live_mid = get_mid_price(sym_now)
-                    ctx = st.session_state.latest_context
+                now_tw = snap_pkg["now_tw"]
+                live_round_str = snap_pkg["live_round_str"]
+                live_sec_left = snap_pkg["live_sec_left"]
+                live_slot = snap_pkg["live_slot"]
+                sym_now = snap_pkg["sym_now"]
+                live_ev = snap_pkg["live_ev"]
 
-                    # 若剛換新 5 分局，即時拉取最新 K 線避免沿用上一局開盤基準價
-                    if ctx is None or ctx.get("symbol") != sym_now or ctx.get("round_5m_open_str") != live_round_str:
-                        d1_live = add_technical_indicators(fetch_1m_klines(sym_now, live_epoch_5m, limit=60))
-                        d5_live = add_technical_indicators(resample_klines(d1_live, "5min"))
-                        t1h_live = fetch_1h_trend(sym_now, live_epoch_5m)
-                        live_ev, ctx = evaluate_market_v31(
-                            sym_now, d1_live, d5_live, live_mid, t1h_live, True, 30, 70, True
-                        )
+                # 防呆 2：偵測疑似「買漲 / 買跌欄位填反」
+                swap_warning = None
+                if not bypass_guard:
+                    diff_now = live_ev["price_diff"]
+                    z_now = live_ev["z_score"]
+                    if up_val is not None and up_val > 0:
+                        if diff_now > 0 and z_now >= 0.35 and up_val > 12.0:
+                            swap_warning = f"鎖定/當下為 UP 領先 (Z=+{z_now:.2f})，UP 報價不應高達 {up_val:.2f} U"
+                        elif diff_now < 0 and z_now <= -0.60 and up_val < 6.5:
+                            swap_warning = f"鎖定/當下為 DOWN 領先 (Z={z_now:.2f})，落後側 UP 報價不應低至 {up_val:.2f} U"
+                    if dn_val is not None and dn_val > 0 and swap_warning is None:
+                        if diff_now < 0 and z_now <= -0.35 and dn_val > 12.0:
+                            swap_warning = f"鎖定/當下為 DOWN 領先 (Z={z_now:.2f})，DOWN 報價不應高達 {dn_val:.2f} U"
+                        elif diff_now > 0 and z_now >= 0.60 and dn_val < 6.5:
+                            swap_warning = f"鎖定/當下為 UP 領先 (Z=+{z_now:.2f})，落後側 DOWN 報價不應低至 {dn_val:.2f} U"
+
+                if swap_warning is not None:
+                    # 攔截失敗時保留凍結快照，讓使用者修正重送不遺失瞬間
+                    st.session_state.last_submit_feedback = (
+                        "error",
+                        f"⚠️ **疑似買漲/買跌欄位填反，已自動攔截（凍結狀態已保留）！**\n\n"
+                        f"{swap_warning}。請確認順序為「左 UP 右 DOWN」後重填，或勾選略過防呆送出。"
+                    )
+                else:
+                    notes = ["V3.1"]
+                    if used_freeze:
+                        notes.append("凍結快照")
+                    if up_val == 0:
+                        notes.append("UP鎖單")
+                    if dn_val == 0:
+                        notes.append("DOWN鎖單")
+                    if bypass_guard:
+                        notes.append("強制寫入")
+
+                    vig_pct = ""
+                    if up_val and dn_val and up_val > 0 and dn_val > 0:
+                        vig_pct = round(((5.0 / up_val) + (5.0 / dn_val) - 1.0) * 100.0, 2)
+
+                    time_label = f"{now_tw.strftime('%Y-%m-%d')} ({WEEKDAY_MAP[now_tw.weekday()]}) {now_tw.strftime('%H:%M:%S')}"
+                    row_data = [
+                        time_label,
+                        live_round_str,
+                        sym_now,
+                        live_sec_left,
+                        live_slot,
+                        round(live_ev["base_price"], 4),
+                        round(live_ev["mid_price"], 4),
+                        round(live_ev["price_diff"], 4),
+                        round(live_ev["atr_1m"], 4),
+                        round(live_ev["moat_ratio"], 2),
+                        round(live_ev["sigma_1m"], 6),
+                        round(live_ev["z_score"], 2),
+                        round(live_ev["p_est"] * 100.0, 2),
+                        round(live_ev["target_5u"], 2),
+                        live_ev["direction"],
+                        live_ev["tactic_tag"],
+                        round(live_ev["vol_ratio"], 2),
+                        "是" if live_ev["is_low_vol"] else "否",
+                        round(live_ev["taker_buy_ratio"] * 100.0, 1),
+                        round(live_ev["rsi_1m"], 1),
+                        live_ev["trend_1h"],
+                        up_val if up_val is not None else "",
+                        dn_val if dn_val is not None else "",
+                        vig_pct,
+                        " / ".join(notes),
+                    ]
+
+                    st.session_state.local_records.append(dict(zip(SHEET_HEADERS, row_data)))
+
+                    # 組合回饋摘要（清楚顯示寫入的 UP/DOWN 與抽水率）
+                    val_parts = []
+                    if up_val is not None:
+                        val_parts.append(f"UP:{up_val:g}")
+                    if dn_val is not None:
+                        val_parts.append(f"DOWN:{dn_val:g}")
+                    vig_str = f" ｜ 抽水 {vig_pct:.2f}%" if vig_pct != "" else ""
+                    mode_prefix = "【凍結快照】" if used_freeze else ""
+
+                    if ws is not None:
+                        try:
+                            ws.append_row(row_data, value_input_option="USER_ENTERED")
+                            st.session_state.last_submit_feedback = (
+                                "success",
+                                f"✅ 已寫入{mode_prefix} Google Sheets！"
+                                f"({sym_now.replace('USDT', '')} 剩 {live_sec_left}s ｜ {' / '.join(val_parts)}{vig_str})"
+                            )
+                        except Exception as e:
+                            st.session_state.last_submit_feedback = (
+                                "error",
+                                f"寫入 Google Sheets 失敗，已改存本頁暫存：{e}"
+                            )
                     else:
-                        # 核心升級：用送出當毫秒的即時 Mid 價與剩餘秒數重算 V3.1 全部指標（零 10 秒快照延遲）
-                        mid_use = live_mid if live_mid is not None else ctx["base_price"]
-                        live_ev = evaluate_v31_from_scalars(
-                            sym_now, ctx["base_price"], mid_use, ctx["atr_1m"], ctx["sig_park10"],
-                            ctx["vol_ratio"], ctx["taker_buy_ratio"], ctx["rsi_1m"],
-                            ctx["bb_upper"], ctx["bb_lower"], ctx["trend_1h"],
-                            live_sec_left, live_round_str, live_is_trap, live_slot,
-                            ctx["enable_rebound"], ctx["rsi_long_th"], ctx["rsi_short_th"],
-                            ctx["only_low_vol_alert"]
+                        st.session_state.last_submit_feedback = (
+                            "success",
+                            f"✅ 已暫存{mode_prefix} ({len(st.session_state.local_records)} 筆 ｜ {' / '.join(val_parts)}{vig_str})"
                         )
 
-                    # 防呆 2：偵測疑似「買漲 / 買跌欄位填反」（例如 UP 領先卻在 UP 填 55.09）
-                    swap_warning = None
-                    if not bypass_guard:
-                        diff_now = live_ev["price_diff"]
-                        z_now = live_ev["z_score"]
-                        if up_val is not None and up_val > 0:
-                            if diff_now > 0 and z_now >= 0.35 and up_val > 12.0:
-                                swap_warning = f"目前為 UP 領先 (Z=+{z_now:.2f})，UP 報價不應高達 {up_val:.2f} U"
-                            elif diff_now < 0 and z_now <= -0.60 and up_val < 6.5:
-                                swap_warning = f"目前為 DOWN 領先 (Z={z_now:.2f})，落後側 UP 報價不應低至 {up_val:.2f} U"
-                        if dn_val is not None and dn_val > 0 and swap_warning is None:
-                            if diff_now < 0 and z_now <= -0.35 and dn_val > 12.0:
-                                swap_warning = f"目前為 DOWN 領先 (Z={z_now:.2f})，DOWN 報價不應高達 {dn_val:.2f} U"
-                            elif diff_now > 0 and z_now >= 0.60 and dn_val < 6.5:
-                                swap_warning = f"目前為 UP 領先 (Z=+{z_now:.2f})，落後側 DOWN 報價不應低至 {dn_val:.2f} U"
+                    # 成功寫入後自動解除凍結並刷新側邊欄狀態
+                    st.session_state.frozen_snapshot = None
+                    st.rerun()
 
-                    if swap_warning is not None:
-                        st.error(
-                            f"⚠️ **疑似買漲/買跌欄位填反，已自動攔截！**\n\n"
-                            f"{swap_warning}。請確認欄位後重填，若為極端插針確認無誤可勾選「略過欄位防呆」送出。"
-                        )
-                    else:
-                        notes = ["V3.1"]
-                        if up_val == 0:
-                            notes.append("UP鎖單")
-                        if dn_val == 0:
-                            notes.append("DOWN鎖單")
-                        if bypass_guard:
-                            notes.append("強制寫入")
-
-                        vig_pct = ""
-                        if up_val and dn_val and up_val > 0 and dn_val > 0:
-                            vig_pct = round(((5.0 / up_val) + (5.0 / dn_val) - 1.0) * 100.0, 2)
-
-                        time_label = f"{now_tw.strftime('%Y-%m-%d')} ({WEEKDAY_MAP[now_tw.weekday()]}) {now_tw.strftime('%H:%M:%S')}"
-                        row_data = [
-                            time_label,
-                            live_round_str,
-                            sym_now,
-                            live_sec_left,
-                            live_slot,
-                            round(live_ev["base_price"], 4),
-                            round(live_ev["mid_price"], 4),
-                            round(live_ev["price_diff"], 4),
-                            round(live_ev["atr_1m"], 4),
-                            round(live_ev["moat_ratio"], 2),
-                            round(live_ev["sigma_1m"], 6),
-                            round(live_ev["z_score"], 2),
-                            round(live_ev["p_est"] * 100.0, 2),
-                            round(live_ev["target_5u"], 2),
-                            live_ev["direction"],
-                            live_ev["tactic_tag"],
-                            round(live_ev["vol_ratio"], 2),
-                            "是" if live_ev["is_low_vol"] else "否",
-                            round(live_ev["taker_buy_ratio"] * 100.0, 1),
-                            round(live_ev["rsi_1m"], 1),
-                            live_ev["trend_1h"],
-                            up_val if up_val is not None else "",
-                            dn_val if dn_val is not None else "",
-                            vig_pct,
-                            " / ".join(notes),
-                        ]
-
-                        st.session_state.local_records.append(dict(zip(SHEET_HEADERS, row_data)))
-
-                        if ws is not None:
-                            try:
-                                ws.append_row(row_data, value_input_option="USER_ENTERED")
-                                st.success(
-                                    f"✅ 已永久寫入 Google Sheets！"
-                                    f"({sym_now.replace('USDT', '')} 剩 {live_sec_left}s ｜ V3.1勝率 {live_ev['p_est']*100:.1f}%)"
-                                )
-                            except Exception as e:
-                                st.error(f"寫入失敗，已改存本頁暫存：{e}")
-                        else:
-                            st.success(f"✅ 已暫存 ({len(st.session_state.local_records)} 筆)，可點下方下載 CSV。")
-            except ValueError:
-                st.error("⚠️ 請輸入純數字（例如 6.70 或 0）")
+    # 顯示最新一次送出結果回饋
+    if st.session_state.last_submit_feedback is not None:
+        fb_level, fb_msg = st.session_state.last_submit_feedback
+        if fb_level == "success":
+            st.success(fb_msg)
+        elif fb_level == "warning":
+            st.warning(fb_msg)
+        else:
+            st.error(fb_msg)
 
     if st.session_state.local_records:
         df_backup = pd.DataFrame(st.session_state.local_records)
@@ -772,6 +942,8 @@ st.title("🎯 Binance Predict 5分鐘實證狙擊系統 V3.1")
 
 def select_symbol(sym):
     st.session_state.selected_symbol = sym
+    st.session_state.frozen_snapshot = None
+    st.session_state.last_submit_feedback = None
 
 
 col_btns, col_price, col_toggle = st.columns([1.6, 1.6, 1.9])
@@ -877,7 +1049,6 @@ def show_prediction_dashboard(
     if ctx is not None:
         st.session_state.latest_context = ctx
 
-    # 午間陷阱時段警示橫幅
     if is_trap_hour:
         st.warning("⚠️ **目前為午間陷阱時段 (12:00 ~ 15:00)**：實測順勢交易嚴重負 EV（平日 -0.49U/筆），建議觀望或僅留意 12~30U 極端搶反彈。")
 
@@ -994,5 +1165,5 @@ with st.expander("📖 V3.1 Parkinson-10 精準定價版規則說明 (點擊展�
 
     ### 3. 搶反彈黃金報價區 (12 ~ 30 U) 與收集器防呆
     * 搶反彈維持 **`≥ 90 秒`**、**`≤ 1.8x ATR`**、**1H 防接刀**三防線，並限制在 App 報價 **`建議門檻 ~ 30 U`** 內出手（`>30U` 樂透區實測 0 勝率直接跳過）。
-    * 側邊欄收集器於按下 Enter 當下**即時重算最新價格與 V3.1 勝率**（零 10 秒延遲），並自動攔截超過 `500 U` 或買漲／買跌疑似填反的誤打資料。
+    * **凍結快照 ＋ 雙邊快填**：看到雙邊報價先按 **`📸 鎖定當下瞬間`** 凍結價格與剩餘秒數，再於第一格輸入 `UP DOWN`（空白分隔，如 `6.14 23.33`）按 Enter 一次寫入並自動計算造市商抽水率。
     """)
