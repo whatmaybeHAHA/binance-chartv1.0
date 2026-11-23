@@ -763,7 +763,7 @@ with st.sidebar:
         st.markdown("💡 **快填技巧**：第一格直接打 **`UP DOWN`**（空白分隔，如 `6.14 23.33`）按 **Enter** 一次存雙邊；單邊可分格填，鎖單填 `0`。")
         c_up, c_dn = st.columns(2)
         with c_up:
-            up_input = st.text_input("🟢 UP｜雙邊快填", placeholder="6.70 或 6.14 23.33")
+            up_input = st.text_input("🟢 UP｜雙填", placeholder="6.70 或 6.14 23.33")
         with c_dn:
             dn_input = st.text_input("🔴 DOWN (單填)", placeholder="選填或0")
         bypass_guard = st.checkbox("略過欄位防呆（極端行情強制寫入）", value=False)
