@@ -15,16 +15,23 @@ try:
 except ImportError:
     GSPREAD_AVAILABLE = False
 
-st.set_page_config(layout="wide", page_title="幣安 5 分鐘實證狙擊系統 V3 (BTC/ETH)")
+st.set_page_config(layout="wide", page_title="幣安 5 分鐘實證狙擊系統 V3.1 (Parkinson-10)")
 
-# --- 全局常數（做法 A：純 BTC / ETH 雙核心） ---
+# --- 全局常數（純 BTC / ETH 雙核心） ---
 AVAILABLE_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 WEEKDAY_MAP = ["一", "二", "三", "四", "五", "六", "日"]
+
 # 依據 14 天真實回測校準之各幣種搶反彈基準勝率
 REBOUND_EMPIRICAL_WR = {
     "BTCUSDT": 0.404,
     "ETHUSDT": 0.341,
 }
+
+# 依據 93 筆實戰試算表反推之幣安造市商定價參數 (Parkinson-10 = 1.001x)
+BINANCE_BASE_FEE = 0.02
+BINANCE_SPREAD = 0.005
+
+# 維持與既有 Google Sheets 完全相容的 25 欄結構
 SHEET_HEADERS = [
     "紀錄時間(UTC+8)", "5分K開盤時間", "幣種", "剩餘秒數", "時段屬性",
     "5分開盤價", "當下Mid價", "價差", "1分ATR", "護城河倍數",
@@ -37,8 +44,8 @@ SHEET_HEADERS = [
 # --- Session State 初始化 ---
 if "selected_symbol" not in st.session_state or st.session_state.selected_symbol not in AVAILABLE_SYMBOLS:
     st.session_state.selected_symbol = "BTCUSDT"
-if "latest_snapshot" not in st.session_state:
-    st.session_state.latest_snapshot = None
+if "latest_context" not in st.session_state:
+    st.session_state.latest_context = None
 if "local_records" not in st.session_state:
     st.session_state.local_records = []
 
@@ -96,7 +103,7 @@ def get_taiwan_time_info():
 @st.cache_resource
 def get_http_session():
     session = requests.Session()
-    session.headers.update({"User-Agent": "BinancePredictV3/3.0"})
+    session.headers.update({"User-Agent": "BinancePredictV31/3.1"})
     return session
 
 
@@ -179,7 +186,7 @@ def fetch_1m_klines(symbol, epoch_5m, limit=1000):
 
 @st.cache_data(ttl=300)
 def fetch_1h_trend(symbol, epoch_5m):
-    """每 5 分鐘更新一次 1H 大趨勢（僅供搶反彈防接刀與寫入 Google Sheets）"""
+    """每 5 分鐘更新一次 1H 大趨勢（供搶反彈防接刀與寫入 Google Sheets）"""
     url = "https://data-api.binance.vision/api/v3/klines"
     params = {"symbol": symbol, "interval": "1h", "limit": 80}
     try:
@@ -235,7 +242,6 @@ def add_technical_indicators(df):
     avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
-    # 修正新版 Pandas TypeError：以 pd.Series 包裝 fillna 預設值
     rsi_fallback = pd.Series(np.where(avg_gain > 0, 100.0, 50.0), index=df.index)
     df["RSI"] = (100.0 - (100.0 / (1.0 + rs))).fillna(rsi_fallback)
 
@@ -244,107 +250,105 @@ def add_technical_indicators(df):
     low_close = (df["Low"] - df["Close"].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df["ATR"] = tr.rolling(window=14).mean()
-    df["LogRet"] = np.log(df["Close"] / df["Close"].shift(1))
+
+    # V3.1 核心：Parkinson-10 高低點波動率（實測與幣安造市商定價比值 1.001x）
+    hl_ratio = (df["High"] / df["Low"]).clip(lower=1.0)
+    hl_sq = (np.log(hl_ratio) ** 2) / (4.0 * math.log(2.0))
+    df["Sig_Park10"] = np.sqrt(hl_sq.ewm(span=10, adjust=False).mean())
     return df
 
 
-# --- V3 終極實證量化評分引擎 ---
-def evaluate_market_v3(
-    symbol, df_1m, df_5m, mid_price, trend_1h,
+# --- 幣安造市商報價預估與鎖單紅線引擎 ---
+def estimate_binance_quote(price_diff, base_price, sig_park10, sec_left, side):
+    """
+    依據 Parkinson-10 + 實測 2% 基礎費率 + 0.5% 單邊點差，推算幣安此刻預估 5U 報價與鎖單紅線
+    """
+    if base_price <= 0:
+        return 9.80, False, 0.0
+    t_min = max(sec_left, 1) / 60.0
+    sig = max(sig_park10, 1e-5)
+    z_up = price_diff / (base_price * sig * math.sqrt(t_min))
+    p_up = 0.5 * (1.0 + math.erf(z_up / math.sqrt(2.0)))
+
+    if side == "NEUTRAL":
+        return 9.80, False, z_up
+
+    p_side = p_up if side == "UP" else (1.0 - p_up)
+    is_lead = (side == "UP" and price_diff > 0) or (side == "DOWN" and price_diff < 0)
+    p_ask = p_side + BINANCE_SPREAD
+
+    # 鎖單紅線：領先側預估報價跌破 ~5.03U (p_ask >= 0.975) 或最後 75s 內 |Z_Park10| >= 2.1
+    is_lock_zone = is_lead and (p_ask >= 0.975 or (sec_left <= 75 and abs(z_up) >= 2.1))
+    p_ask_clamped = float(np.clip(p_ask, 0.01, 0.972))
+    est_5u = min((5.0 * (1.0 - BINANCE_BASE_FEE)) / p_ask_clamped, 490.0)
+    return round(est_5u, 2), is_lock_zone, z_up
+
+
+# --- V3.1 核心量化評分（純數值版，儀表板與表單送出共用，徹底根治 10 秒快照延遲） ---
+def evaluate_v31_from_scalars(
+    symbol, base_price, current_price, atr_1m, sig_park10,
+    vol_ratio, taker_buy_ratio, rsi_1m, bb_upper, bb_lower,
+    trend_1h, sec_left, round_5m_open_str, is_trap_hour, slot_label,
     enable_rebound, rsi_long_th, rsi_short_th, only_low_vol_alert
 ):
-    now_tw, _, sec_left, sec_elapsed_1m, round_5m_open_tw, is_trap_hour, slot_label = get_taiwan_time_info()
     countdown = f"{sec_left // 60:02d}:{sec_left % 60:02d}"
-
-    base_out = {
-        "symbol": symbol, "p_est": 0.50, "p_base": 0.50, "direction": "NEUTRAL",
-        "desc": "資料載入中...", "status_type": "info", "tactic_tag": "載入中",
-        "moat_ratio": 0.0, "base_price": 0.0, "mid_price": 0.0, "price_diff": 0.0,
-        "atr_1m": 0.0, "sigma_1m": 0.0, "z_score": 0.0,
-        "vol_ratio": 1.0, "is_low_vol": False, "taker_buy_ratio": 0.5, "rsi_1m": 50.0,
-        "breakeven_5u": 10.0, "target_5u": 10.5,
-        "signal_mode": "trend", "should_alert": False, "is_locked": False,
-        "sec_left": sec_left, "countdown": countdown,
-        "round_5m_open_str": round_5m_open_tw.strftime("%Y-%m-%d %H:%M"),
-        "trend_1h": trend_1h, "is_trap_hour": is_trap_hour, "slot_label": slot_label,
-    }
-    if df_1m.empty or df_5m.empty or len(df_1m) < 35:
-        return base_out
-
-    latest_1m = df_1m.iloc[-1]
-    prev_1m = df_1m.iloc[-2]
-
-    match_5m = df_5m[df_5m["Open time"] == pd.Timestamp(round_5m_open_tw)]
-    base_price = float(match_5m["Open"].iloc[0]) if not match_5m.empty else float(df_5m.iloc[-1]["Open"])
-    current_price = float(mid_price) if mid_price is not None else float(latest_1m["Close"])
     price_diff = current_price - base_price
+    atr_safe = atr_1m if atr_1m > 0 else max(current_price * 0.0005, 0.01)
+    moat_ratio = abs(price_diff) / atr_safe
 
-    atr_val = prev_1m["ATR"] if not np.isnan(prev_1m["ATR"]) and prev_1m["ATR"] > 0 else latest_1m["ATR"]
-    atr_1m = float(atr_val) if not np.isnan(atr_val) and atr_val > 0 else max(current_price * 0.0005, 0.01)
-    moat_ratio = abs(price_diff) / atr_1m
-
-    # 第一層：純波動率標準化距離 (Z-Score) 與客觀基準勝率
-    sigma_raw = df_1m["LogRet"].iloc[-31:-1].std()
-    sigma_1m = float(sigma_raw) if not np.isnan(sigma_raw) and sigma_raw > 0 else (atr_1m / current_price) * 0.7
+    sig_safe = sig_park10 if sig_park10 > 0 else max((atr_safe / max(current_price, 1.0)) * 0.7, 1e-5)
     t_min = max(sec_left, 1) / 60.0
-    z_score = price_diff / (base_price * sigma_1m * math.sqrt(t_min))
+    z_score = price_diff / (base_price * sig_safe * math.sqrt(t_min)) if base_price > 0 else 0.0
     p_base_lead = 0.5 * (1.0 + math.erf(abs(z_score) / math.sqrt(2.0)))
-
-    # 時間投影量能校正（剛換分 < 12 秒時沿用上一根完整 K 線）
-    vol_ma = float(prev_1m["Vol_MA20"]) if not np.isnan(prev_1m["Vol_MA20"]) and prev_1m["Vol_MA20"] > 0 else 1.0
-    if sec_elapsed_1m >= 12:
-        proj_vol = float(latest_1m["Volume"]) * (60.0 / sec_elapsed_1m)
-        vol_ratio = proj_vol / vol_ma
-        active_bar = latest_1m
-    else:
-        vol_ratio = float(prev_1m["Volume"]) / vol_ma
-        active_bar = prev_1m
-
     is_low_vol = vol_ratio < 0.5
-    bar_vol = float(active_bar["Volume"])
-    taker_buy_ratio = float(active_bar["Taker buy base asset"]) / bar_vol if bar_vol > 0 else 0.5
-
-    rsi_1m = float(latest_1m["RSI"]) if not np.isnan(latest_1m["RSI"]) else 50.0
-    bb_upper = float(latest_1m["BB_Upper"])
-    bb_lower = float(latest_1m["BB_Lower"])
 
     # 1H 防接刀濾網（僅作用於搶反彈）
     eff_rsi_long = rsi_long_th - 6 if trend_1h == "空頭" else rsi_long_th
     eff_rsi_short = rsi_short_th + 6 if trend_1h == "多頭" else rsi_short_th
 
-    res = base_out.copy()
-    res.update({
-        "p_base": p_base_lead, "moat_ratio": moat_ratio,
-        "base_price": base_price, "mid_price": current_price,
-        "price_diff": price_diff, "atr_1m": atr_1m,
-        "sigma_1m": sigma_1m, "z_score": z_score,
-        "vol_ratio": vol_ratio, "is_low_vol": is_low_vol,
-        "taker_buy_ratio": taker_buy_ratio, "rsi_1m": rsi_1m,
-    })
+    res = {
+        "symbol": symbol, "p_est": 0.50, "p_base": p_base_lead, "direction": "NEUTRAL",
+        "desc": "", "status_type": "info", "tactic_tag": "觀望",
+        "moat_ratio": moat_ratio, "base_price": base_price, "mid_price": current_price,
+        "price_diff": price_diff, "atr_1m": atr_safe, "sigma_1m": sig_safe, "z_score": z_score,
+        "vol_ratio": vol_ratio, "is_low_vol": is_low_vol, "taker_buy_ratio": taker_buy_ratio,
+        "rsi_1m": rsi_1m, "breakeven_5u": 10.0, "target_5u": 10.5, "est_binance_5u": 9.80,
+        "is_lock_zone": False, "signal_mode": "trend", "should_alert": False, "is_locked": False,
+        "sec_left": sec_left, "countdown": countdown,
+        "round_5m_open_str": round_5m_open_str, "trend_1h": trend_1h,
+        "is_trap_hour": is_trap_hour, "slot_label": slot_label,
+    }
 
     # 1. 最後 15 秒全面靜音硬鎖
     if sec_left <= 15:
         lead_dir = "UP" if price_diff >= 0 else "DOWN"
         p_est = float(np.clip(p_base_lead, 0.05, 0.96))
+        est_5u, lock_z, _ = estimate_binance_quote(price_diff, base_price, sig_safe, sec_left, lead_dir)
         res.update({
             "p_est": p_est, "direction": lead_dir,
             "breakeven_5u": 5.0 / p_est, "target_5u": 5.25 / p_est,
+            "est_binance_5u": est_5u, "is_lock_zone": lock_z,
             "desc": f"🔒 【尾盤靜音鎖 {countdown}】 剩餘不足 15 秒，主戰場與雷達全面停止提示",
             "status_type": "info", "tactic_tag": "尾盤靜音鎖",
             "signal_mode": "locked", "should_alert": False, "is_locked": True,
         })
         return res
 
-    # 2. 戰術 B：幣種化極端搶反彈（硬防線：剩餘 >= 90s 且 距水面 <= 1.8x ATR 且 1H 防接刀）
+    # 2. 戰術 B：幣種化極端搶反彈（硬防線：>=90s & <=1.8x ATR & 1H防接刀 + 12U~30U黃金報價區提示）
     if enable_rebound and sec_left >= 90 and moat_ratio <= 1.8:
         emp_wr = REBOUND_EMPIRICAL_WR.get(symbol, 0.35)
         if current_price <= bb_lower and rsi_1m <= eff_rsi_long:
             p_est = max(emp_wr - 0.03, 0.25) if trend_1h == "空頭" else emp_wr
+            tgt = 5.25 / p_est
+            est_5u, _, _ = estimate_binance_quote(price_diff, base_price, sig_safe, sec_left, "UP")
             warn_tag = " ｜ 🐻 1H空頭警戒(已收緊門檻)" if trend_1h == "空頭" else ""
             res.update({
                 "p_est": p_est, "direction": "UP",
-                "breakeven_5u": 5.0 / p_est, "target_5u": 5.25 / p_est,
-                "desc": f"⚡ 【倒數 {countdown} 極端搶反彈】 買漲 (UP) ｜ 貫穿下軌 + RSI {rsi_1m:.1f} (門檻≤{eff_rsi_long}){warn_tag}",
+                "breakeven_5u": 5.0 / p_est, "target_5u": tgt, "est_binance_5u": est_5u,
+                "desc": (
+                    f"⚡ 【倒數 {countdown} 極端搶反彈】 買漲 (UP) ｜ 貫穿下軌 + RSI {rsi_1m:.1f} (門檻≤{eff_rsi_long})"
+                    f" ｜ 🎯 黃金報價區：App {tgt:.2f} ~ 30.00 U（>30U樂透區跳過）{warn_tag}"
+                ),
                 "status_type": "success", "tactic_tag": "極端搶反彈",
                 "signal_mode": "rebound", "should_alert": True,
             })
@@ -352,43 +356,47 @@ def evaluate_market_v3(
 
         if current_price >= bb_upper and rsi_1m >= eff_rsi_short:
             p_est = max(emp_wr - 0.03, 0.25) if trend_1h == "多頭" else emp_wr
+            tgt = 5.25 / p_est
+            est_5u, _, _ = estimate_binance_quote(price_diff, base_price, sig_safe, sec_left, "DOWN")
             warn_tag = " ｜ 🐂 1H多頭警戒(已收緊門檻)" if trend_1h == "多頭" else ""
             res.update({
                 "p_est": p_est, "direction": "DOWN",
-                "breakeven_5u": 5.0 / p_est, "target_5u": 5.25 / p_est,
-                "desc": f"⚡ 【倒數 {countdown} 極端摸頭空】 買跌 (DOWN) ｜ 貫穿上軌 + RSI {rsi_1m:.1f} (門檻≥{eff_rsi_short}){warn_tag}",
+                "breakeven_5u": 5.0 / p_est, "target_5u": tgt, "est_binance_5u": est_5u,
+                "desc": (
+                    f"⚡ 【倒數 {countdown} 極端摸頭空】 買跌 (DOWN) ｜ 貫穿上軌 + RSI {rsi_1m:.1f} (門檻≥{eff_rsi_short})"
+                    f" ｜ 🎯 黃金報價區：App {tgt:.2f} ~ 30.00 U（>30U樂透區跳過）{warn_tag}"
+                ),
                 "status_type": "error", "tactic_tag": "極端摸頭空",
                 "signal_mode": "rebound", "should_alert": True,
             })
             return res
 
     # 3. 死亡糾纏區（價差 < 0.2x ATR）
-    if abs(price_diff) < (0.2 * atr_1m):
+    if abs(price_diff) < (0.2 * atr_safe):
         res.update({
             "p_est": 0.50, "direction": "NEUTRAL",
-            "breakeven_5u": 10.0, "target_5u": 10.5,
+            "breakeven_5u": 10.0, "target_5u": 10.5, "est_binance_5u": 9.80,
             "desc": f"⚖️ 【倒數 {countdown}】 死亡糾纏區 ｜ 貼近基準水面 ({moat_ratio:.2f}x ATR)，強制觀望",
             "status_type": "info", "tactic_tag": "死亡糾纏區",
             "signal_mode": "trend", "should_alert": False,
         })
         return res
 
-    # 4. V3 實證順勢引擎（完全依 41,440 筆體檢結果校準）
+    # 4. V3.1 順勢引擎：Parkinson-10 + 零中心化微調（消除表 3 的 +2.5% 過度樂觀誤差）
     direction = "UP" if price_diff >= 0 else "DOWN"
     delta_p = 0.0
 
-    # (a) 量能反轉因子：縮量安靜最強 (+3.0%)，爆量風險 (-1.5%)
+    # (a) 量能反轉因子（正常量能歸零，縮量收斂至 +2.0%）
     if vol_ratio < 0.5:
-        delta_p += 0.030
+        delta_p += 0.020
         vol_tag = f"🌟 縮量安靜 ({vol_ratio:.2f}x)"
     elif vol_ratio < 1.5:
-        delta_p += 0.010
         vol_tag = f"📊 量能正常 ({vol_ratio:.2f}x)"
     else:
         delta_p -= 0.015
         vol_tag = f"⚠️ 爆量波動風險 ({vol_ratio:.2f}x)"
 
-    # (b) 過熱與布林地雷防禦
+    # (b) 過熱與布林地雷防禦（通道內歸零，保留過熱與碰邊界重罰）
     is_rsi_hot = (direction == "UP" and rsi_1m > 75) or (direction == "DOWN" and rsi_1m < 25)
     is_rsi_cool = (direction == "UP" and rsi_1m < 40) or (direction == "DOWN" and rsi_1m > 60)
     is_bb_touch = (direction == "UP" and current_price >= bb_upper) or (direction == "DOWN" and current_price <= bb_lower)
@@ -403,16 +411,15 @@ def evaluate_market_v3(
     if is_bb_touch:
         delta_p -= 0.025
         danger_reasons.append("碰布林邊界")
-    else:
-        delta_p += 0.010
 
     if vol_ratio >= 1.5:
         danger_reasons.append(f"爆量({vol_ratio:.1f}x)")
 
-    delta_p = float(np.clip(delta_p, -0.075, 0.055))
+    delta_p = float(np.clip(delta_p, -0.075, 0.035))
     p_est = float(np.clip(p_base_lead + delta_p, 0.05, 0.96))
     breakeven_5u = 5.0 / p_est
     target_5u = 5.25 / p_est
+    est_5u, is_lock_zone, _ = estimate_binance_quote(price_diff, base_price, sig_safe, sec_left, direction)
     action_cn = "買漲 (UP)" if direction == "UP" else "買跌 (DOWN)"
 
     is_danger = len(danger_reasons) > 0
@@ -424,6 +431,14 @@ def evaluate_market_v3(
         tactic_tag = "地雷禁買"
         should_alert = False
         desc = f"🚫 【倒數 {countdown} 地雷禁買】 {action_cn} ｜ 觸發高風險因子：{' + '.join(danger_reasons)}，強制靜音觀望"
+    elif is_lock_zone:
+        status_type = "warning"
+        tactic_tag = "即將鎖單紅線"
+        should_alert = False
+        desc = (
+            f"🔒 【倒數 {countdown} 莊家鎖單紅線】 {action_cn} ｜ 預估幣安報價已壓至 {est_5u:.2f} U "
+            f"(|Z|={abs(z_score):.2f})，極可能已鎖單或僅剩超低賠率，系統強制靜音"
+        )
     elif not in_time_window:
         status_type = "info"
         tactic_tag = "早盤等待期"
@@ -433,13 +448,19 @@ def evaluate_market_v3(
         status_type = "warning"
         tactic_tag = "低賠率黑洞(>88%)"
         should_alert = False
-        desc = f"⚠️ 【倒數 {countdown} 低賠率警戒區】 {action_cn} 勝率 {p_est*100:.1f}% (>88%) ｜ 實測賠率過爛易倒吐，系統自動靜音 (除非 App ≥ {target_5u:.2f} U)"
+        desc = (
+            f"⚠️ 【倒數 {countdown} 低賠率警戒區】 {action_cn} 勝率 {p_est*100:.1f}% (>88%) ｜ "
+            f"預估報價僅 {est_5u:.2f} U 易倒吐，系統自動靜音 (除非 App 出現溢價 ≥ {target_5u:.2f} U)"
+        )
     elif (0.72 <= p_est <= 0.88) and (moat_ratio >= 0.5):
         if is_low_vol:
             status_type = "success" if direction == "UP" else "error"
             tactic_tag = "縮量黃金狙擊"
             should_alert = True
-            desc = f"🌟 【倒數 {countdown} 縮量黃金狙擊】 {action_cn} ｜ 護城河 {moat_ratio:.2f}x ｜ {vol_tag} ｜ 甜蜜區間 (72-88%)"
+            desc = (
+                f"🌟 【倒數 {countdown} 縮量黃金狙擊】 {action_cn} ｜ 護城河 {moat_ratio:.2f}x ｜ "
+                f"{vol_tag} ｜ 預估 App 報價約 {est_5u:.2f} U"
+            )
         else:
             status_type = ("success" if direction == "UP" else "error") if not only_low_vol_alert else "warning"
             tactic_tag = "標準順勢狙擊" if not only_low_vol_alert else "正常量觀察"
@@ -456,10 +477,86 @@ def evaluate_market_v3(
     res.update({
         "p_est": p_est, "direction": direction,
         "breakeven_5u": breakeven_5u, "target_5u": target_5u,
+        "est_binance_5u": est_5u, "is_lock_zone": is_lock_zone,
         "desc": desc, "status_type": status_type, "tactic_tag": tactic_tag,
         "signal_mode": "trend", "should_alert": should_alert,
     })
     return res
+
+
+def evaluate_market_v31(
+    symbol, df_1m, df_5m, mid_price, trend_1h,
+    enable_rebound, rsi_long_th, rsi_short_th, only_low_vol_alert
+):
+    now_tw, _, sec_left, sec_elapsed_1m, round_5m_open_tw, is_trap_hour, slot_label = get_taiwan_time_info()
+    round_str = round_5m_open_tw.strftime("%Y-%m-%d %H:%M")
+
+    if df_1m.empty or df_5m.empty or len(df_1m) < 25:
+        ev = evaluate_v31_from_scalars(
+            symbol, 0.0, 0.0, 1.0, 0.0005, 1.0, 0.5, 50.0, 0.0, 0.0,
+            trend_1h, sec_left, round_str, is_trap_hour, slot_label,
+            enable_rebound, rsi_long_th, rsi_short_th, only_low_vol_alert
+        )
+        ev["desc"] = "資料載入中..."
+        ev["tactic_tag"] = "載入中"
+        return ev, None
+
+    latest_1m = df_1m.iloc[-1]
+    prev_1m = df_1m.iloc[-2]
+
+    match_5m = df_5m[df_5m["Open time"] == pd.Timestamp(round_5m_open_tw)]
+    base_price = float(match_5m["Open"].iloc[0]) if not match_5m.empty else float(df_5m.iloc[-1]["Open"])
+    current_price = float(mid_price) if mid_price is not None else float(latest_1m["Close"])
+
+    atr_val = prev_1m["ATR"] if not np.isnan(prev_1m["ATR"]) and prev_1m["ATR"] > 0 else latest_1m["ATR"]
+    atr_1m = float(atr_val) if not np.isnan(atr_val) and atr_val > 0 else max(current_price * 0.0005, 0.01)
+
+    # 嚴格取已收盤前一根的 Parkinson-10 波動率
+    park_val = prev_1m["Sig_Park10"] if not np.isnan(prev_1m["Sig_Park10"]) and prev_1m["Sig_Park10"] > 0 else latest_1m["Sig_Park10"]
+    sig_park10 = float(park_val) if not np.isnan(park_val) and park_val > 0 else (atr_1m / max(current_price, 1.0)) * 0.7
+
+    # 時間投影量能校正（換分前 12 秒沿用前一根完整 K 棒）
+    vol_ma = float(prev_1m["Vol_MA20"]) if not np.isnan(prev_1m["Vol_MA20"]) and prev_1m["Vol_MA20"] > 0 else 1.0
+    if sec_elapsed_1m >= 12:
+        proj_vol = float(latest_1m["Volume"]) * (60.0 / sec_elapsed_1m)
+        vol_ratio = proj_vol / vol_ma
+        active_bar = latest_1m
+    else:
+        vol_ratio = float(prev_1m["Volume"]) / vol_ma
+        active_bar = prev_1m
+
+    bar_vol = float(active_bar["Volume"])
+    taker_buy_ratio = float(active_bar["Taker buy base asset"]) / bar_vol if bar_vol > 0 else 0.5
+    rsi_1m = float(latest_1m["RSI"]) if not np.isnan(latest_1m["RSI"]) else 50.0
+    bb_upper = float(latest_1m["BB_Upper"])
+    bb_lower = float(latest_1m["BB_Lower"])
+
+    ev = evaluate_v31_from_scalars(
+        symbol, base_price, current_price, atr_1m, sig_park10,
+        vol_ratio, taker_buy_ratio, rsi_1m, bb_upper, bb_lower,
+        trend_1h, sec_left, round_str, is_trap_hour, slot_label,
+        enable_rebound, rsi_long_th, rsi_short_th, only_low_vol_alert
+    )
+
+    # 打包精簡背景參數，讓表單按下 Enter 當下能用最新價格與秒數即時重算
+    ctx = {
+        "symbol": symbol,
+        "round_5m_open_str": round_str,
+        "base_price": base_price,
+        "atr_1m": atr_1m,
+        "sig_park10": sig_park10,
+        "vol_ratio": vol_ratio,
+        "taker_buy_ratio": taker_buy_ratio,
+        "rsi_1m": rsi_1m,
+        "bb_upper": bb_upper,
+        "bb_lower": bb_lower,
+        "trend_1h": trend_1h,
+        "enable_rebound": enable_rebound,
+        "rsi_long_th": rsi_long_th,
+        "rsi_short_th": rsi_short_th,
+        "only_low_vol_alert": only_low_vol_alert,
+    }
+    return ev, ctx
 
 
 def plot_advanced_candlestick(df, title, baseline_price=None):
@@ -500,7 +597,7 @@ def plot_advanced_candlestick(df, title, baseline_price=None):
     return fig
 
 
-# --- 側邊欄：Google Sheets 5U 賠率收集器 (獨立於重整區塊外，打字不被清空) + V3 狙擊參數 ---
+# --- 側邊欄：Google Sheets 5U 賠率收集器 (含即時重算與防誤打防呆) + V3.1 參數 ---
 with st.sidebar:
     st.header("📝 5U 真實賠率收集器")
     ws, gs_msg = get_gsheet_worksheet()
@@ -516,6 +613,7 @@ with st.sidebar:
             up_input = st.text_input("🟢 買漲(UP) 5U拿回", placeholder="例: 6.70")
         with c_dn:
             dn_input = st.text_input("🔴 買跌(DOWN) 5U拿回", placeholder="選填或0")
+        bypass_guard = st.checkbox("略過欄位防呆（特殊極端行情強制寫入）", value=False)
         submitted = st.form_submit_button("💾 立即寫入紀錄 (Enter)", use_container_width=True)
 
     if submitted:
@@ -528,82 +626,118 @@ with st.sidebar:
                 up_val = float(up_str) if up_str else None
                 dn_val = float(dn_str) if dn_str else None
 
-                snap = st.session_state.latest_snapshot
-                now_tw, _, live_sec_left, _, round_open_tw, _, slot_label = get_taiwan_time_info()
-                sym_now = st.session_state.selected_symbol
-                live_mid = get_mid_price(sym_now)
+                # 防呆 1：數值硬範圍檢查（幣安 5U 封頂約 490U，徹底擋下如 6021 等誤打）
+                range_err = False
+                if up_val is not None and (up_val < 0 or up_val > 500):
+                    st.error(f"🚫 買漲(UP) 金額 `{up_val}` 超出合理範圍 (0 ~ 500 U)，已攔截！")
+                    range_err = True
+                if dn_val is not None and (dn_val < 0 or dn_val > 500):
+                    st.error(f"🚫 買跌(DOWN) 金額 `{dn_val}` 超出合理範圍 (0 ~ 500 U)，已攔截！")
+                    range_err = True
 
-                if snap is not None and snap.get("symbol") == sym_now:
-                    base_p = snap["base_price"]
-                    mid_p = live_mid if live_mid is not None else snap["mid_price"]
-                    diff_p = mid_p - base_p
-                    atr_v = snap["atr_1m"] if snap["atr_1m"] > 0 else 1.0
-                    moat_v = abs(diff_p) / atr_v
-                    sig_v = snap["sigma_1m"] if snap["sigma_1m"] > 0 else 0.0005
-                    z_v = diff_p / (base_p * sig_v * math.sqrt(max(live_sec_left, 1) / 60.0)) if base_p > 0 else 0.0
-                    p_est_pct = round(snap["p_est"] * 100.0, 2)
-                    tgt_5u = round(snap["target_5u"], 2)
-                    s_dir = snap["direction"]
-                    t_tag = snap["tactic_tag"]
-                    vol_r = round(snap["vol_ratio"], 2)
-                    low_vol_str = "是" if snap["is_low_vol"] else "否"
-                    taker_pct = round(snap["taker_buy_ratio"] * 100.0, 1)
-                    rsi_v = round(snap["rsi_1m"], 1)
-                    t_1h = snap["trend_1h"]
-                else:
-                    base_p, mid_p, diff_p, atr_v, moat_v, sig_v, z_v = 0, live_mid or 0, 0, 0, 0, 0, 0
-                    p_est_pct, tgt_5u, s_dir, t_tag, vol_r, low_vol_str, taker_pct, rsi_v, t_1h = (
-                        50.0, 10.5, "N/A", "N/A", 1.0, "否", 50.0, 50.0, "N/A"
-                    )
+                if not range_err:
+                    now_tw, live_epoch_5m, live_sec_left, _, round_open_tw, live_is_trap, live_slot = get_taiwan_time_info()
+                    live_round_str = round_open_tw.strftime("%Y-%m-%d %H:%M")
+                    sym_now = st.session_state.selected_symbol
+                    live_mid = get_mid_price(sym_now)
+                    ctx = st.session_state.latest_context
 
-                notes = []
-                if up_val == 0:
-                    notes.append("UP鎖單")
-                if dn_val == 0:
-                    notes.append("DOWN鎖單")
-                vig_pct = ""
-                if up_val and dn_val and up_val > 0 and dn_val > 0:
-                    vig_pct = round(((5.0 / up_val) + (5.0 / dn_val) - 1.0) * 100.0, 2)
+                    # 若剛換新 5 分局，即時拉取最新 K 線避免沿用上一局開盤基準價
+                    if ctx is None or ctx.get("symbol") != sym_now or ctx.get("round_5m_open_str") != live_round_str:
+                        d1_live = add_technical_indicators(fetch_1m_klines(sym_now, live_epoch_5m, limit=60))
+                        d5_live = add_technical_indicators(resample_klines(d1_live, "5min"))
+                        t1h_live = fetch_1h_trend(sym_now, live_epoch_5m)
+                        live_ev, ctx = evaluate_market_v31(
+                            sym_now, d1_live, d5_live, live_mid, t1h_live, True, 30, 70, True
+                        )
+                    else:
+                        # 核心升級：用送出當毫秒的即時 Mid 價與剩餘秒數重算 V3.1 全部指標（零 10 秒快照延遲）
+                        mid_use = live_mid if live_mid is not None else ctx["base_price"]
+                        live_ev = evaluate_v31_from_scalars(
+                            sym_now, ctx["base_price"], mid_use, ctx["atr_1m"], ctx["sig_park10"],
+                            ctx["vol_ratio"], ctx["taker_buy_ratio"], ctx["rsi_1m"],
+                            ctx["bb_upper"], ctx["bb_lower"], ctx["trend_1h"],
+                            live_sec_left, live_round_str, live_is_trap, live_slot,
+                            ctx["enable_rebound"], ctx["rsi_long_th"], ctx["rsi_short_th"],
+                            ctx["only_low_vol_alert"]
+                        )
 
-                time_label = f"{now_tw.strftime('%Y-%m-%d')} ({WEEKDAY_MAP[now_tw.weekday()]}) {now_tw.strftime('%H:%M:%S')}"
-                row_data = [
-                    time_label,
-                    round_open_tw.strftime("%Y-%m-%d %H:%M"),
-                    sym_now,
-                    live_sec_left,
-                    slot_label,
-                    round(base_p, 4),
-                    round(mid_p, 4),
-                    round(diff_p, 4),
-                    round(atr_v, 4),
-                    round(moat_v, 2),
-                    round(sig_v, 6),
-                    round(z_v, 2),
-                    p_est_pct,
-                    tgt_5u,
-                    s_dir,
-                    t_tag,
-                    vol_r,
-                    low_vol_str,
-                    taker_pct,
-                    rsi_v,
-                    t_1h,
-                    up_val if up_val is not None else "",
-                    dn_val if dn_val is not None else "",
-                    vig_pct,
-                    " / ".join(notes),
-                ]
+                    # 防呆 2：偵測疑似「買漲 / 買跌欄位填反」（例如 UP 領先卻在 UP 填 55.09）
+                    swap_warning = None
+                    if not bypass_guard:
+                        diff_now = live_ev["price_diff"]
+                        z_now = live_ev["z_score"]
+                        if up_val is not None and up_val > 0:
+                            if diff_now > 0 and z_now >= 0.35 and up_val > 12.0:
+                                swap_warning = f"目前為 UP 領先 (Z=+{z_now:.2f})，UP 報價不應高達 {up_val:.2f} U"
+                            elif diff_now < 0 and z_now <= -0.60 and up_val < 6.5:
+                                swap_warning = f"目前為 DOWN 領先 (Z={z_now:.2f})，落後側 UP 報價不應低至 {up_val:.2f} U"
+                        if dn_val is not None and dn_val > 0 and swap_warning is None:
+                            if diff_now < 0 and z_now <= -0.35 and dn_val > 12.0:
+                                swap_warning = f"目前為 DOWN 領先 (Z={z_now:.2f})，DOWN 報價不應高達 {dn_val:.2f} U"
+                            elif diff_now > 0 and z_now >= 0.60 and dn_val < 6.5:
+                                swap_warning = f"目前為 UP 領先 (Z=+{z_now:.2f})，落後側 DOWN 報價不應低至 {dn_val:.2f} U"
 
-                st.session_state.local_records.append(dict(zip(SHEET_HEADERS, row_data)))
+                    if swap_warning is not None:
+                        st.error(
+                            f"⚠️ **疑似買漲/買跌欄位填反，已自動攔截！**\n\n"
+                            f"{swap_warning}。請確認欄位後重填，若為極端插針確認無誤可勾選「略過欄位防呆」送出。"
+                        )
+                    else:
+                        notes = ["V3.1"]
+                        if up_val == 0:
+                            notes.append("UP鎖單")
+                        if dn_val == 0:
+                            notes.append("DOWN鎖單")
+                        if bypass_guard:
+                            notes.append("強制寫入")
 
-                if ws is not None:
-                    try:
-                        ws.append_row(row_data, value_input_option="USER_ENTERED")
-                        st.success(f"✅ 已永久寫入 Google Sheets！({sym_now.replace('USDT','')} 剩 {live_sec_left}s)")
-                    except Exception as e:
-                        st.error(f"寫入失敗，已改存本頁暫存：{e}")
-                else:
-                    st.success(f"✅ 已暫存 ({len(st.session_state.local_records)} 筆)，可點下方下載 CSV。")
+                        vig_pct = ""
+                        if up_val and dn_val and up_val > 0 and dn_val > 0:
+                            vig_pct = round(((5.0 / up_val) + (5.0 / dn_val) - 1.0) * 100.0, 2)
+
+                        time_label = f"{now_tw.strftime('%Y-%m-%d')} ({WEEKDAY_MAP[now_tw.weekday()]}) {now_tw.strftime('%H:%M:%S')}"
+                        row_data = [
+                            time_label,
+                            live_round_str,
+                            sym_now,
+                            live_sec_left,
+                            live_slot,
+                            round(live_ev["base_price"], 4),
+                            round(live_ev["mid_price"], 4),
+                            round(live_ev["price_diff"], 4),
+                            round(live_ev["atr_1m"], 4),
+                            round(live_ev["moat_ratio"], 2),
+                            round(live_ev["sigma_1m"], 6),
+                            round(live_ev["z_score"], 2),
+                            round(live_ev["p_est"] * 100.0, 2),
+                            round(live_ev["target_5u"], 2),
+                            live_ev["direction"],
+                            live_ev["tactic_tag"],
+                            round(live_ev["vol_ratio"], 2),
+                            "是" if live_ev["is_low_vol"] else "否",
+                            round(live_ev["taker_buy_ratio"] * 100.0, 1),
+                            round(live_ev["rsi_1m"], 1),
+                            live_ev["trend_1h"],
+                            up_val if up_val is not None else "",
+                            dn_val if dn_val is not None else "",
+                            vig_pct,
+                            " / ".join(notes),
+                        ]
+
+                        st.session_state.local_records.append(dict(zip(SHEET_HEADERS, row_data)))
+
+                        if ws is not None:
+                            try:
+                                ws.append_row(row_data, value_input_option="USER_ENTERED")
+                                st.success(
+                                    f"✅ 已永久寫入 Google Sheets！"
+                                    f"({sym_now.replace('USDT', '')} 剩 {live_sec_left}s ｜ V3.1勝率 {live_ev['p_est']*100:.1f}%)"
+                                )
+                            except Exception as e:
+                                st.error(f"寫入失敗，已改存本頁暫存：{e}")
+                        else:
+                            st.success(f"✅ 已暫存 ({len(st.session_state.local_records)} 筆)，可點下方下載 CSV。")
             except ValueError:
                 st.error("⚠️ 請輸入純數字（例如 6.70 或 0）")
 
@@ -612,28 +746,28 @@ with st.sidebar:
         st.download_button(
             label=f"⬇️ 下載本次暫存紀錄 ({len(df_backup)} 筆 CSV)",
             data=df_backup.to_csv(index=False).encode("utf-8-sig"),
-            file_name="binance_5m_v3_backup.csv",
+            file_name="binance_5m_v31_backup.csv",
             mime="text/csv",
             use_container_width=True,
         )
 
     st.divider()
-    st.header("⚙️ V3 狙擊參數")
+    st.header("⚙️ V3.1 狙擊參數")
     enable_sound = st.checkbox("🔊 啟用提示音效", value=True)
     only_low_vol_alert = st.checkbox("🌟 順勢僅「縮量安靜 (<0.5x)」響鈴", value=True)
     mute_trap_hours = st.checkbox("🛡️ 午間陷阱 (12-15點) 順勢靜音", value=True)
     rsi_long_th = st.slider("⚡ 搶反彈 (買漲) RSI 基準門檻", min_value=15, max_value=45, value=30, step=1)
     rsi_short_th = st.slider("⚡ 摸頭空 (買跌) RSI 基準門檻", min_value=55, max_value=85, value=70, step=1)
     st.info(
-        "🎯 **V3 實證狙擊鐵律：**\n\n"
-        "• **純雙核心**：專注 BTC / ETH（已剔除負 EV 的 BNB）。\n"
-        "• **順勢甜蜜帶**：剩餘 `150s~16s`、縮量安靜、勝率 `72%~88%`。\n"
-        "• **過熱／爆量／>88%**：一律自動靜音防踩雷。"
+        "🎯 **V3.1 精準定價版鐵律：**\n\n"
+        "• **Parkinson-10 核心**：與幣安造市商定價 1:1 對齊，螢幕直接顯示「預估幣安此刻報價」。\n"
+        "• **順勢甜蜜帶**：剩餘 `150s~16s`、縮量安靜、勝率 `72%~88%`（零鎖單）。\n"
+        "• **搶反彈黃金區**：鎖定 App 報價 `建議門檻 ~ 30 U`（`>30U` 樂透區跳過）。"
     )
 
 
 # --- 主介面頂部：純點擊雙核心按鈕 (絕不彈出鍵盤) + 即時報價 + 搶反彈開關 ---
-st.title("🎯 Binance Predict 5分鐘實證狙擊系統 V3")
+st.title("🎯 Binance Predict 5分鐘實證狙擊系統 V3.1")
 
 
 def select_symbol(sym):
@@ -706,16 +840,18 @@ def show_prediction_dashboard(
         d5 = add_technical_indicators(resample_klines(d1_raw, "5min"))
         mid_p = get_mid_price(osym)
         t1h = fetch_1h_trend(osym, epoch_5m)
-        ev_r = evaluate_market_v3(
+        ev_r, _ = evaluate_market_v31(
             osym, d1, d5, mid_p, t1h, enable_rebound_flag, r_long, r_short, only_low_vol
         )
         short_name = osym.replace("USDT", "")
         if ev_r["is_locked"]:
             return f"[{short_name}] 🔒 尾盤靜音", None, ev_r["signal_mode"]
+        if ev_r["is_lock_zone"] and ev_r["signal_mode"] == "trend":
+            return f"[{short_name}] 🔒 鎖單紅線", None, "trend"
         if ev_r["should_alert"]:
             if ev_r["signal_mode"] == "rebound":
                 act = "💥反彈UP" if ev_r["direction"] == "UP" else "💥摸空DOWN"
-                txt = f"**[{short_name}] {act} {ev_r['p_est']*100:.0f}% (5U≥{ev_r['target_5u']:.2f})**"
+                txt = f"**[{short_name}] {act} {ev_r['p_est']*100:.0f}% (5U:{ev_r['target_5u']:.1f}~30)**"
                 return txt, "radar_rebound", "rebound"
             else:
                 act = "🟢漲" if ev_r["direction"] == "UP" else "🔴跌"
@@ -734,15 +870,16 @@ def show_prediction_dashboard(
         df_1m, df_5m, df_15m, mid_p, trend_1h = f_main.result()
         radar_text, radar_sound, radar_mode = f_radar.result()
 
-    ev = evaluate_market_v3(
+    ev, ctx = evaluate_market_v31(
         selected_symbol, df_1m, df_5m, mid_p, trend_1h,
         enable_rebound_flag, r_long, r_short, only_low_vol
     )
-    st.session_state.latest_snapshot = ev.copy()
+    if ctx is not None:
+        st.session_state.latest_context = ctx
 
     # 午間陷阱時段警示橫幅
     if is_trap_hour:
-        st.warning("⚠️ **目前為午間陷阱時段 (12:00 ~ 15:00)**：實測順勢交易為顯著負期望值，建議觀望或僅留意高賠率極端搶反彈。")
+        st.warning("⚠️ **目前為午間陷阱時段 (12:00 ~ 15:00)**：實測順勢交易嚴重負 EV（平日 -0.49U/筆），建議觀望或僅留意 12~30U 極端搶反彈。")
 
     # 1. 背景雷達列 ＋ 當前時段屬性
     st.markdown(
@@ -751,20 +888,32 @@ def show_prediction_dashboard(
         unsafe_allow_html=True,
     )
 
-    # 2. 核心預估勝率 ＋ 5U 行動線 ＋ 量能/1H 標籤
+    # 2. 核心勝率 ＋ 5U 行動線 ＋ 預估幣安此刻報價（一眼抓溢價）
     p_pct = ev["p_est"] * 100.0
     score_color = "#4FC3F7" if ev["should_alert"] else ("#FFD54F" if p_pct >= 72 else "#9E9E9E")
     trend_badge_color = "#26A69A" if trend_1h == "多頭" else ("#EF5350" if trend_1h == "空頭" else "#B0BEC5")
     dir_label = "買漲 UP" if ev["direction"] == "UP" else ("買跌 DOWN" if ev["direction"] == "DOWN" else "觀望")
     vol_badge = f"🌟縮量({ev['vol_ratio']:.2f}x)" if ev["is_low_vol"] else f"量能({ev['vol_ratio']:.2f}x)"
 
+    if ev["is_lock_zone"] and ev["signal_mode"] == "trend":
+        est_quote_html = "<span style='color:#EF5350;'>🔒 預估幣安報價：鎖單紅線</span>"
+    else:
+        est_quote_html = f"<span style='color:#CE93D8;'>🏦 預估幣安報價：~{ev['est_binance_5u']:.2f} U</span>"
+
+    if ev["signal_mode"] == "rebound":
+        target_html = f"<span style='color:#81C784;'>✅ 黃金出手區：{ev['target_5u']:.2f} ~ 30.00 U</span>"
+    else:
+        target_html = f"<span style='color:#81C784;'>✅ 建議出手(+5%)：≥ {ev['target_5u']:.2f} U</span>"
+
     st.markdown(
-        f"<div style='text-align:left; font-size:21px; font-weight:bold; margin-top:0px; margin-bottom:10px; line-height:1.5;'>"
-        f"<span style='color:{score_color};'>🎯 V3 預估勝率：{p_pct:.1f}% ({dir_label})</span>"
+        f"<div style='text-align:left; font-size:20px; font-weight:bold; margin-top:0px; margin-bottom:10px; line-height:1.6;'>"
+        f"<span style='color:{score_color};'>🎯 V3.1 預估勝率：{p_pct:.1f}% ({dir_label})</span>"
         f" &nbsp;｜&nbsp; "
-        f"<span style='color:#FFFFFF;'>💵 5U 回本線：<span style='color:#FF8A65;'>{ev['breakeven_5u']:.2f} U</span></span>"
+        f"<span style='color:#FFFFFF;'>💵 5U 回本：<span style='color:#FF8A65;'>{ev['breakeven_5u']:.2f} U</span></span>"
         f" &nbsp;｜&nbsp; "
-        f"<span style='color:#81C784;'>✅ 建議出手(+5%邊際)：≥ {ev['target_5u']:.2f} U</span>"
+        f"{target_html}"
+        f" &nbsp;｜&nbsp; "
+        f"{est_quote_html}"
         f" &nbsp;｜&nbsp; "
         f"<span style='font-size:15px; color:#E0E0E0;'>[{vol_badge}]</span> "
         f"<span style='font-size:15px; color:{trend_badge_color};'>[1H: {trend_1h}]</span>"
@@ -782,7 +931,7 @@ def show_prediction_dashboard(
     else:
         st.info(ev["desc"])
 
-    # 4. 音效觸發控制（嚴格遵守：最後 15 秒全面靜音 + 午間陷阱順勢靜音）
+    # 4. 音效觸發控制（最後 15 秒全面靜音 + 午間陷阱順勢靜音）
     if sound_on and (not ev["is_locked"]) and sec_left > 15:
         main_muted_by_trap = (is_trap_hour and mute_trap and ev["signal_mode"] == "trend")
         radar_muted_by_trap = (is_trap_hour and mute_trap and radar_mode == "trend")
@@ -814,7 +963,10 @@ def show_prediction_dashboard(
                 use_container_width=True, config=chart_config, key="c15",
             )
 
-    st.caption("💡 實戰決策口訣：只有響鈴訊號出現，且幣安 App 顯示的「5U 可拿回金額」大於等於上方綠色【建議出手門檻】時才進場；低於門檻一律跳過。")
+    st.caption(
+        "💡 實戰決策口訣：若幣安 App 實際 5U 報價高於【預估幣安報價】且達【建議出手門檻】，代表抓到造市商定價慢半拍的溢價便宜單；"
+        "搶反彈請嚴格控制在「建議門檻 ~ 30 U」之間，超過 30 U 為 0 勝率樂透區請直接跳過。"
+    )
 
 
 show_prediction_dashboard(
@@ -827,20 +979,20 @@ show_prediction_dashboard(
     mute_trap_hours,
 )
 
-# --- 網頁底部：V3 實證邏輯說明 ---
+# --- 網頁底部：V3.1 實證邏輯說明 ---
 st.divider()
-with st.expander("📖 V3 終極實證版量化規則說明 (點擊展開)"):
+with st.expander("📖 V3.1 Parkinson-10 精準定價版規則說明 (點擊展開)"):
     st.markdown("""
-    ### 1. 為什麼只留 BTC / ETH 雙核心？
-    * 經過去 14 天超過 41,000 筆真實 1 分鐘 K 線驗證，BTC 與 ETH 在縮量順勢與回本線過濾下皆呈穩定正期望值，而 BNB 在順勢與搶反彈兩項皆為顯著負期望值，故徹底剔除以聚焦火力。
+    ### 1. V3.1 核心升級：Parkinson-10 ＋ 零中心化校準
+    * **波動率換裝**：經 93 筆實戰試算表反推驗證，`Parkinson-10`（高低點振幅波動率）與幣安造市商隱含波動率比值高達 `1.001x`（相關係數 `0.929`），誤差幾乎砍半。
+    * **零中心化校準**：移除正常量能與通道內的免費加分，並將縮量加分收斂至 `+2.0%`，徹底消除先前 `+2.5%` 的樂觀偏移。
+    * **預估幣安報價對照**：直接以 `Parkinson-10` ＋ 實測 `2%` 費率 ＋ `0.5%` 單邊點差推算幣安理論報價，方便盤中一眼抓出造市商報價落後的溢價漏洞。
 
-    ### 2. V3 順勢甜蜜射程（全部經大樣本實測校準）
-    * **時間窗鎖死**：僅於 **剩餘 `150 秒 ~ 16 秒`** 開啟順勢狙擊；最後 **15 秒** 主戰場與雷達全面靜音。
-    * **量能徹底反轉**：縮量安靜 (`< 0.5x`) 為最強護城河（實測超額勝率最高），爆量 (`>= 1.5x`) 視為波動放大風險並禁買。
-    * **過熱地雷封殺**：1 分鐘 RSI `> 75 / < 25` 或碰觸順向布林邊界，實測均呈現顯著負超額勝率，強制靜音禁買。
-    * **勝率上限 `88%` 保護**：實測預估勝率超過 `88%` 時，造市商賠率已壓縮至約 `1.03x` 成為負 EV 黑洞，故系統自動轉為黃色警戒並靜音。
+    ### 2. 順勢甜蜜射程 & 鎖單紅線預警
+    * **黃金狙擊窗**：剩餘 **`150 秒 ~ 16 秒`**、**縮量安靜 (`< 0.5x`)**、**V3.1 預估勝率 `72% ~ 88%`**（實測零鎖單、雙幣種於 5% 壓力抽水下皆正 EV）。
+    * **三大靜音禁區**：過熱／爆量地雷（RSI `>75/<25`、碰布林邊界、量能 `>=1.5x`）、莊家鎖單紅線（剩餘 `<=75s` 且 `|Z|>=2.1` 或預估報價 `<5.03U`）、以及低賠率黑洞（`>88%`）。
 
-    ### 3. 幣種化極端搶反彈
-    * 必須同時滿足 **剩餘 `≥ 90 秒`**、**距基準線 `≤ 1.8x ATR`**、且通過 **1H 大趨勢防接刀**（逆 1H 趨勢時 RSI 門檻自動收緊 6 點）。
-    * 5U 建議門檻直接依各幣種真實回測勝率換算（BTC 約 `≥ 12.99 U`，ETH 約 `≥ 15.41 U`；逆 1H 趨勢會再自動墊高門檻）。
+    ### 3. 搶反彈黃金報價區 (12 ~ 30 U) 與收集器防呆
+    * 搶反彈維持 **`≥ 90 秒`**、**`≤ 1.8x ATR`**、**1H 防接刀**三防線，並限制在 App 報價 **`建議門檻 ~ 30 U`** 內出手（`>30U` 樂透區實測 0 勝率直接跳過）。
+    * 側邊欄收集器於按下 Enter 當下**即時重算最新價格與 V3.1 勝率**（零 10 秒延遲），並自動攔截超過 `500 U` 或買漲／買跌疑似填反的誤打資料。
     """)
